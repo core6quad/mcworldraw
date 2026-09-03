@@ -264,6 +264,7 @@ pub fn block_color(name: &str) -> [u8; 3] {
         "minecraft:fern" => [75, 145, 45],
         "minecraft:large_fern" => [75, 145, 45],
         "minecraft:dandelion" => [255, 220, 50],
+        "minecraft:golden_dandelion" => [250, 175, 40],
         "minecraft:poppy" => [220, 50, 50],
         "minecraft:blue_orchid" => [100, 80, 220],
         "minecraft:allium" => [180, 130, 220],
@@ -276,6 +277,12 @@ pub fn block_color(name: &str) -> [u8; 3] {
         "minecraft:cornflower" => [80, 100, 220],
         "minecraft:lily_of_the_valley" => [240, 240, 200],
         "minecraft:wither_rose" => [80, 40, 60],
+        "minecraft:torchflower" => [170, 92, 165],
+        "minecraft:wildflowers" => [148, 148, 116],
+        "minecraft:pink_petals" => [232, 168, 192],
+        "minecraft:cactus_flower" => [230, 118, 172],
+        "minecraft:closed_eyeblossom" => [150, 120, 160],
+        "minecraft:open_eyeblossom" => [185, 140, 195],
         "minecraft:sunflower" => [250, 200, 50],
         "minecraft:lily_pad" => [60, 140, 50],
         "minecraft:seagrass" => [50, 160, 80],
@@ -286,6 +293,7 @@ pub fn block_color(name: &str) -> [u8; 3] {
         "minecraft:glow_berries" => [220, 100, 130],
         "minecraft:glow_lichen" => [100, 220, 150],
         "minecraft:hanging_roots" => [100, 70, 50],
+        "minecraft:mangrove_propagule" => [128, 98, 66],
         "minecraft:big_dripleaf" => [60, 140, 50],
         "minecraft:small_dripleaf" => [60, 140, 50],
         "minecraft:azalea" => [60, 130, 45],
@@ -567,6 +575,18 @@ mod tests {
         assert_eq!(block_color("minecraft:obsidian"), [28, 24, 38]);
         assert_eq!(block_color("minecraft:glowstone"), [250, 218, 138]);
         assert_eq!(block_color("minecraft:oak_planks"), [162, 130, 78]);
+    }
+
+    #[test]
+    fn flower_blocks_have_colors() {
+        assert_eq!(block_color("minecraft:torchflower"), [170, 92, 165]);
+        assert_eq!(block_color("minecraft:wildflowers"), [148, 148, 116]);
+        assert_eq!(block_color("minecraft:pink_petals"), [232, 168, 192]);
+        assert_eq!(block_color("minecraft:cactus_flower"), [230, 118, 172]);
+        assert_eq!(block_color("minecraft:closed_eyeblossom"), [150, 120, 160]);
+        assert_eq!(block_color("minecraft:open_eyeblossom"), [185, 140, 195]);
+        assert_eq!(block_color("minecraft:mangrove_propagule"), [128, 98, 66]);
+        assert_eq!(block_color("minecraft:golden_dandelion"), [250, 175, 40]);
     }
 
     #[test]
