@@ -11,25 +11,18 @@ Example command:
 cargo run --release -- "path/to/world" -s -r -hs -ao -t -b
 ```
 
-## Launch flags:
 
--s = Render the whole world as a single image
+## Launch flags
 
--z int = Downscale the map (2 will change the scale to 2 blocks per pixel, etc...)
-
--d -1,0,1 = Dimension to render, custom dimensions are not supported. 0 is overworld, 1 is the nether and -1 is the end
-
--r = enables shadows, unsupported without -s
-
--ss = SuperSample: Bumps the resolution, now each block is 5 pixels in size. can't use with -z
-
--hs = HyperSample: Bumps the resolution more, now each block is 15 pixels in size. can't use with -z
-
--ao = ambient occlusion on block edges. Only with Super/Hypersampling
-
--b = Bloom on lava, torches and glowstone. Super/Hypersampling only
-
--t = Transparency on water, allowing to see underwater blocks
-
--n = Night mode (WIP)
-
+| Flag | Description |
+|------|-------------|
+| `-s` | Render the whole world as a single image |
+| `-z <int>` | Downscale the map (`2` = 2 blocks per pixel, etc.) |
+| `-d <-1,0,1>` | Dimension to render. `0` = Overworld, `1` = Nether, `-1` = End. Custom dimensions are not supported |
+| `-r` | Enables shadows. Requires `-s` |
+| `-ss` | SuperSample. Bumps the resolution so each block is 5 pixels in size. Cannot be used with `-z` |
+| `-hs` | HyperSample. Bumps the resolution so each block is 15 pixels in size. Cannot be used with `-z` |
+| `-ao` | Ambient occlusion on block edges. Requires SuperSampling or HyperSampling |
+| `-b` | Bloom on lava, torches, and glowstone. Requires SuperSampling or HyperSampling |
+| `-t` | Transparency on water, allowing you to see underwater blocks |
+| `-n` | Night mode (WIP) |
