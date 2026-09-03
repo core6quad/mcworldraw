@@ -26,7 +26,7 @@ use args::{parse_args, print_usage, HYPER_SAMPLE, SUPER_SAMPLE};
 use chunk::{CHUNK_SIZE, VOID_H};
 use color::NO_BLOCK;
 use dimension::{dimension_info, dimension_region_path};
-use light::{ambient_occlusion, bloom, compute_shadows, supersampled_heights};
+use light::{ambient_occlusion, bloom, compute_shadows, supersampled_heights, BLOOM_RADIUS_BLOCKS, NIGHT_BLOOM_RADIUS_BLOCKS};
 use region::{
     collect_grid, process_region, process_region_single, process_region_single_ss, scan_region,
     Bounds,
@@ -201,6 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     bounds.min_x,
                     bounds.min_z,
                     args.transparency,
+                    args.night,
                     &pb,
                 )?;
             }
@@ -223,7 +224,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 drop(heights);
                 let pixel_bloom = if args.bloom {
-                    Some(bloom(&lights, grid_w, grid_h, s))
+                    let radius = if args.night { NIGHT_BLOOM_RADIUS_BLOCKS } else { BLOOM_RADIUS_BLOCKS };
+                    Some(bloom(&lights, grid_w, grid_h, s, radius))
                 } else {
                     None
                 };
@@ -238,6 +240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     grid_w,
                     grid_h,
                     s,
+                    args.night,
                 );
             } else {
                 let shadow = compute_shadows(&heights, grid_w, grid_h);
@@ -253,6 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     bounds.max_x,
                     bounds.max_z,
                     args.scale,
+                    args.night,
                 );
             }
         } else if let Some(factor) = upsample {
@@ -265,6 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     bounds.min_z,
                     s,
                     args.transparency,
+                    args.night,
                     &pb,
                 )?;
             }
@@ -277,6 +282,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     bounds.min_z,
                     args.scale,
                     args.transparency,
+                    args.night,
                     &pb,
                 )?;
             }
@@ -316,6 +322,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.ambient_occlusion,
             args.bloom,
             args.transparency,
+            args.night,
             &pb,
         )?;
     }

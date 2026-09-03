@@ -17,7 +17,7 @@ use indicatif::ProgressBar;
 use mca::RegionReader;
 
 use crate::chunk::{get_top_blocks, Chunk, CHUNK_SIZE, VOID_H};
-use crate::color::{display_color, light_bloom_color, NO_BLOCK};
+use crate::color::{display_color, light_bloom_color, night_darken, NO_BLOCK};
 use crate::render::{
     blit_supersampled, render_chunk_png, render_chunk_png_ss, render_chunk_png_ss_fx, render_into_big,
 };
@@ -59,6 +59,7 @@ pub(crate) fn process_region(
     ambient_occlusion: bool,
     bloom: bool,
     transparency: bool,
+    night: bool,
     pb: &ProgressBar,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let Some((region_x, region_z)) = parse_region_coords(path) else {
@@ -105,12 +106,13 @@ pub(crate) fn process_region(
                         transparency,
                         ambient_occlusion,
                         bloom,
+                        night,
                     )?;
                 } else {
-                    render_chunk_png_ss(&top, &out_path, upsample, transparency)?;
+                    render_chunk_png_ss(&top, &out_path, upsample, transparency, night)?;
                 }
             } else {
-                render_chunk_png(&top, &out_path, scale, transparency)?;
+                render_chunk_png(&top, &out_path, scale, transparency, night)?;
             }
 
             generated += 1;
@@ -210,6 +212,7 @@ pub(crate) fn collect_grid(
     min_chunk_x: i32,
     min_chunk_z: i32,
     transparency: bool,
+    night: bool,
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some((region_x, region_z)) = parse_region_coords(path) else {
@@ -252,7 +255,8 @@ pub(crate) fn collect_grid(
 
                     let ci = lz * CHUNK_SIZE + lx;
                     heights[gi] = top.heights[ci].unwrap_or(VOID_H);
-                    colors[gi] = display_color(&top.blocks[ci], &top.under[ci], transparency);
+                    let c = display_color(&top.blocks[ci], &top.under[ci], transparency);
+                    colors[gi] = if night { night_darken(c) } else { c };
                     lights[gi] = top
                         .blocks[ci]
                         .as_deref()
@@ -277,6 +281,7 @@ pub(crate) fn process_region_single(
     min_chunk_z: i32,
     scale: u32,
     transparency: bool,
+    night: bool,
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some((region_x, region_z)) = parse_region_coords(path) else {
@@ -322,6 +327,7 @@ pub(crate) fn process_region_single(
                 offset_z as u32,
                 scale,
                 transparency,
+                night,
             );
 
             pb.inc(1);
@@ -341,6 +347,7 @@ pub(crate) fn process_region_single_ss(
     min_chunk_z: i32,
     ss: i32,
     transparency: bool,
+    night: bool,
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some((region_x, region_z)) = parse_region_coords(path) else {
@@ -389,6 +396,7 @@ pub(crate) fn process_region_single_ss(
                 offset_x,
                 offset_z,
                 transparency,
+                night,
             );
 
             pb.inc(1);

@@ -12,8 +12,8 @@ use std::path::Path;
 use image::{Rgb, RgbImage};
 
 use crate::chunk::{ChunkTop, COLUMNS, VOID_H, CHUNK_SIZE};
-use crate::color::{apply_ao, display_color, light_bloom_color, shade, NO_BLOCK};
-use crate::light::{ambient_occlusion, bloom};
+use crate::color::{apply_ao, display_color, light_bloom_color, night_darken, night_shade, shade, NO_BLOCK};
+use crate::light::{ambient_occlusion, bloom, BLOOM_RADIUS_BLOCKS, NIGHT_BLOOM_RADIUS_BLOCKS};
 
 /// Render the top-down view of a chunk as a PNG.
 ///
@@ -26,6 +26,7 @@ pub(crate) fn render_chunk_png(
     out_path: &Path,
     scale: u32,
     transparency: bool,
+    night: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let size = (CHUNK_SIZE + scale as usize - 1) / scale as usize;
 
@@ -41,6 +42,7 @@ pub(crate) fn render_chunk_png(
         0,
         0,
         transparency,
+        night,
     );
 
     img.save(out_path)?;
@@ -61,6 +63,7 @@ pub(crate) fn render_into_big(
     offset_z: u32,
     scale: u32,
     transparency: bool,
+    night: bool,
 ) {
     blit_scaled(
         img,
@@ -72,6 +75,7 @@ pub(crate) fn render_into_big(
         offset_x,
         offset_z,
         transparency,
+        night,
     );
 }
 
@@ -95,6 +99,7 @@ fn blit_scaled(
     origin_x: u32,
     origin_z: u32,
     transparency: bool,
+    night: bool,
 ) {
     let scale = scale.max(1) as usize;
 
@@ -103,7 +108,10 @@ fn blit_scaled(
         for z in 0..region_h {
             for x in 0..region_w {
                 let i = z * region_w + x;
-                let rgb = display_color(&blocks[i], &under[i], transparency);
+                let mut rgb = display_color(&blocks[i], &under[i], transparency);
+                if night {
+                    rgb = night_darken(rgb);
+                }
                 out.put_pixel(origin_x + x as u32, origin_z + z as u32, Rgb(rgb));
             }
         }
@@ -120,7 +128,10 @@ fn blit_scaled(
             let x1 = (x0 + scale).min(region_w);
             let z1 = (z0 + scale).min(region_h);
 
-            let rgb = most_common_color(blocks, under, region_w, x0, x1, z0, z1, transparency);
+            let mut rgb = most_common_color(blocks, under, region_w, x0, x1, z0, z1, transparency);
+            if night {
+                rgb = night_darken(rgb);
+            }
 
             out.put_pixel(origin_x + cx as u32, origin_z + cz as u32, Rgb(rgb));
         }
@@ -145,12 +156,16 @@ pub(crate) fn blit_supersampled(
     origin_x: u32,
     origin_z: u32,
     transparency: bool,
+    night: bool,
 ) {
     let s = s.max(1);
     for z in 0..region_h {
         for x in 0..region_w {
             let i = z * region_w + x;
-            let rgb = display_color(&blocks[i], &under[i], transparency);
+            let mut rgb = display_color(&blocks[i], &under[i], transparency);
+            if night {
+                rgb = night_darken(rgb);
+            }
             let base_x = origin_x + (x as u32) * (s as u32);
             let base_z = origin_z + (z as u32) * (s as u32);
             for dz in 0..s as u32 {
@@ -170,6 +185,7 @@ pub(crate) fn render_chunk_png_ss(
     out_path: &Path,
     scale: u32,
     transparency: bool,
+    night: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let size = CHUNK_SIZE * scale as usize;
     let mut img = RgbImage::new(size as u32, size as u32);
@@ -183,6 +199,7 @@ pub(crate) fn render_chunk_png_ss(
         0,
         0,
         transparency,
+        night,
     );
     img.save(out_path)?;
 
@@ -205,6 +222,7 @@ pub(crate) fn render_chunk_png_ss_fx(
     transparency: bool,
     with_ao: bool,
     with_bloom: bool,
+    night: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let s = scale as usize;
     let size = CHUNK_SIZE * s;
@@ -227,7 +245,8 @@ pub(crate) fn render_chunk_png_ss_fx(
             .iter()
             .map(|b| b.as_deref().and_then(light_bloom_color).unwrap_or(NO_BLOCK))
             .collect();
-        Some(bloom(&lights, CHUNK_SIZE, CHUNK_SIZE, s))
+        let radius = if night { NIGHT_BLOOM_RADIUS_BLOCKS } else { BLOOM_RADIUS_BLOCKS };
+        Some(bloom(&lights, CHUNK_SIZE, CHUNK_SIZE, s, radius))
     } else {
         None
     };
@@ -244,6 +263,7 @@ pub(crate) fn render_chunk_png_ss_fx(
         0,
         0,
         transparency,
+        night,
     );
 
     img.save(out_path)?;
@@ -272,13 +292,17 @@ fn blit_supersampled_fx(
     origin_x: u32,
     origin_z: u32,
     transparency: bool,
+    night: bool,
 ) {
     let s = s.max(1);
     let pw = region_w * s;
     for z in 0..region_h {
         for x in 0..region_w {
             let i = z * region_w + x;
-            let rgb = display_color(&blocks[i], &under[i], transparency);
+            let mut rgb = display_color(&blocks[i], &under[i], transparency);
+            if night {
+                rgb = night_darken(rgb);
+            }
             let base_x = origin_x + (x as u32) * (s as u32);
             let base_z = origin_z + (z as u32) * (s as u32);
             for dz in 0..s as u32 {
@@ -370,7 +394,9 @@ pub(crate) fn render_shaded_map(
     max_chunk_x: i32,
     max_chunk_z: i32,
     scale: u32,
+    night: bool,
 ) {
+    let shade_fn = if night { night_shade } else { shade };
     for cz in min_chunk_z..=max_chunk_z {
         for cx in min_chunk_x..=max_chunk_x {
             let block_x0 = (cx - min_chunk_x) * (CHUNK_SIZE as i32);
@@ -384,7 +410,7 @@ pub(crate) fn render_shaded_map(
                     let gz = block_z0 as usize + lz;
                     let gi = gz * grid_w + gx;
                     let c = colors[gi];
-                    local.push(if shadow[gi] { shade(c) } else { c });
+                    local.push(if shadow[gi] { shade_fn(c) } else { c });
                 }
             }
 
@@ -426,8 +452,10 @@ pub(crate) fn render_ss(
     grid_w: usize,
     grid_h: usize,
     s: usize,
+    night: bool,
 ) {
     let pw = grid_w * s;
+    let shade_fn = if night { night_shade } else { shade };
 
     for z in 0..grid_h {
         for x in 0..grid_w {
@@ -443,7 +471,7 @@ pub(crate) fn render_ss(
                     let mut rgb = c;
                     if let Some(shadow) = pixel_shadow {
                         if shadow[pi] {
-                            rgb = shade(rgb);
+                            rgb = shade_fn(rgb);
                         }
                     }
                     if let Some(ao) = pixel_ao {
@@ -571,7 +599,7 @@ mod tests {
         };
 
         let path = std::env::temp_dir().join("worldraw_test_chunk.png");
-        render_chunk_png(&top, &path, 1, false).expect("render should succeed");
+        render_chunk_png(&top, &path, 1, false, false).expect("render should succeed");
 
         let img = image::open(&path).expect("png should be readable");
         assert_eq!(img.dimensions(), (16, 16));
@@ -603,8 +631,8 @@ mod tests {
         };
 
         let mut img = RgbImage::new(32, 16);
-        render_into_big(&mut img, &top_a, 0, 0, 1, false);
-        render_into_big(&mut img, &top_b, 16, 0, 1, false);
+        render_into_big(&mut img, &top_a, 0, 0, 1, false, false);
+        render_into_big(&mut img, &top_b, 16, 0, 1, false, false);
 
         assert_eq!(img.dimensions(), (32, 16));
 
@@ -636,7 +664,7 @@ mod tests {
         };
 
         let path = std::env::temp_dir().join("worldraw_test_scaled.png");
-        render_chunk_png(&top, &path, 2, false).expect("render should succeed");
+        render_chunk_png(&top, &path, 2, false, false).expect("render should succeed");
 
         let img = image::open(&path).expect("png should be readable");
         assert_eq!(img.dimensions(), (8, 8));
@@ -663,7 +691,7 @@ mod tests {
         };
 
         let path = std::env::temp_dir().join("worldraw_test_scaled4.png");
-        render_chunk_png(&top, &path, 4, false).expect("render should succeed");
+        render_chunk_png(&top, &path, 4, false, false).expect("render should succeed");
 
         let img = image::open(&path).expect("png should be readable");
         assert_eq!(img.dimensions(), (4, 4));
@@ -690,7 +718,7 @@ mod tests {
         let shadow = compute_shadows(&heights, grid_w, grid_h);
 
         let mut img = RgbImage::new(16, 16);
-        render_shaded_map(&mut img, &colors, &shadow, grid_w, 0, 0, 0, 0, 1);
+        render_shaded_map(&mut img, &colors, &shadow, grid_w, 0, 0, 0, 0, 1, false);
 
         let lit = block_color("minecraft:sand");
         let dark = shade(lit);
@@ -718,7 +746,7 @@ mod tests {
         };
 
         let path = std::env::temp_dir().join("worldraw_test_ss.png");
-        render_chunk_png_ss(&top, &path, SUPER_SAMPLE, false).expect("render should succeed");
+        render_chunk_png_ss(&top, &path, SUPER_SAMPLE, false, false).expect("render should succeed");
 
         let img = image::open(&path).expect("png should be readable");
         assert_eq!(img.dimensions(), (16 * 5, 16 * 5));
@@ -752,7 +780,7 @@ mod tests {
         let pixel_shadow = compute_shadows(&pixel_heights, pw, ph);
 
         let mut img = RgbImage::new((grid_w * s) as u32, (grid_h * s) as u32);
-        render_ss(&mut img, &colors, Some(&pixel_shadow), None, None, grid_w, grid_h, s);
+        render_ss(&mut img, &colors, Some(&pixel_shadow), None, None, grid_w, grid_h, s, false);
 
         let lit = block_color("minecraft:sand");
         let dark = shade(lit);
@@ -804,7 +832,7 @@ mod tests {
         };
 
         let path = std::env::temp_dir().join("worldraw_test_hs.png");
-        render_chunk_png_ss(&top, &path, HYPER_SAMPLE, false).expect("render should succeed");
+        render_chunk_png_ss(&top, &path, HYPER_SAMPLE, false, false).expect("render should succeed");
 
         let img = image::open(&path).expect("png should be readable");
         assert_eq!(img.dimensions(), (16 * 15, 16 * 15));
@@ -835,7 +863,7 @@ mod tests {
         let ao = ambient_occlusion(&heights, grid_w, grid_h, s);
 
         let mut img = RgbImage::new((grid_w * s) as u32, (grid_h * s) as u32);
-        render_ss(&mut img, &colors, None, Some(&ao), None, grid_w, grid_h, s);
+        render_ss(&mut img, &colors, None, Some(&ao), None, grid_w, grid_h, s, false);
 
         let lit = block_color("minecraft:sand");
         // The lower block's edge pixel (facing the higher block) is darkened.
@@ -867,7 +895,7 @@ mod tests {
             under: std::array::from_fn(|_| None),
         };
         let path = std::env::temp_dir().join("worldraw_test_ao.png");
-        render_chunk_png_ss_fx(&top, &path, 16, false, true, false)
+        render_chunk_png_ss_fx(&top, &path, 16, false, true, false, false)
             .expect("render should succeed");
 
         let img = image::open(&path).expect("png should be readable");
@@ -898,7 +926,7 @@ mod tests {
         let colors = vec![[0u8, 0, 0]; grid_w * grid_h];
         let mut lights = vec![[0u8, 0, 0]; grid_w * grid_h];
         lights[2] = [255, 200, 90];
-        let bloom_field = bloom(&lights, grid_w, grid_h, s);
+        let bloom_field = bloom(&lights, grid_w, grid_h, s, BLOOM_RADIUS_BLOCKS);
 
         let mut img = RgbImage::new(pw as u32, (grid_h * s) as u32);
         render_ss(
@@ -910,6 +938,7 @@ mod tests {
             grid_w,
             grid_h,
             s,
+            false,
         );
 
         // The torch's own square glows (base black + full bloom at its centre).

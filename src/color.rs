@@ -17,6 +17,18 @@ pub(crate) const NO_BLOCK: [u8; 3] = [0, 0, 0];
 pub(crate) const SHADOW_NUMERATOR: u32 = 55;
 pub(crate) const SHADOW_DENOMINATOR: u32 = 100;
 
+/// Night mode: how strongly the overall scene is darkened. Each RGB channel
+/// is multiplied by `NIGHT_DARK_NUMERATOR / NIGHT_DARK_DENOMINATOR`.
+pub(crate) const NIGHT_DARK_NUMERATOR: u32 = 30;
+pub(crate) const NIGHT_DARK_DENOMINATOR: u32 = 100;
+
+/// Night mode: how strongly a shadowed surface is darkened (almost pitch
+/// black). Each RGB channel is multiplied by
+/// `NIGHT_SHADOW_NUMERATOR / NIGHT_SHADOW_DENOMINATOR`. Applied to the
+/// already night-darkened color.
+pub(crate) const NIGHT_SHADOW_NUMERATOR: u32 = 8;
+pub(crate) const NIGHT_SHADOW_DENOMINATOR: u32 = 100;
+
 /// Transparency blend weights for `--transparency`. When a column's surface is
 /// water, its color is blended with the first solid block beneath it so that
 /// the block below is only *barely* visible through the water: the water color
@@ -32,6 +44,27 @@ pub(crate) fn shade(rgb: [u8; 3]) -> [u8; 3] {
         ((rgb[0] as u32 * SHADOW_NUMERATOR) / SHADOW_DENOMINATOR) as u8,
         ((rgb[1] as u32 * SHADOW_NUMERATOR) / SHADOW_DENOMINATOR) as u8,
         ((rgb[2] as u32 * SHADOW_NUMERATOR) / SHADOW_DENOMINATOR) as u8,
+    ]
+}
+
+/// Darken a color to its night-mode appearance by scaling every channel by
+/// [`NIGHT_DARK_NUMERATOR`] / [`NIGHT_DARK_DENOMINATOR`].
+pub(crate) fn night_darken(rgb: [u8; 3]) -> [u8; 3] {
+    [
+        ((rgb[0] as u32 * NIGHT_DARK_NUMERATOR) / NIGHT_DARK_DENOMINATOR) as u8,
+        ((rgb[1] as u32 * NIGHT_DARK_NUMERATOR) / NIGHT_DARK_DENOMINATOR) as u8,
+        ((rgb[2] as u32 * NIGHT_DARK_NUMERATOR) / NIGHT_DARK_DENOMINATOR) as u8,
+    ]
+}
+
+/// Darken a (night-darkened) color to its night-shadow appearance (almost
+/// pitch black) by scaling every channel by [`NIGHT_SHADOW_NUMERATOR`] /
+/// [`NIGHT_SHADOW_DENOMINATOR`].
+pub(crate) fn night_shade(rgb: [u8; 3]) -> [u8; 3] {
+    [
+        ((rgb[0] as u32 * NIGHT_SHADOW_NUMERATOR) / NIGHT_SHADOW_DENOMINATOR) as u8,
+        ((rgb[1] as u32 * NIGHT_SHADOW_NUMERATOR) / NIGHT_SHADOW_DENOMINATOR) as u8,
+        ((rgb[2] as u32 * NIGHT_SHADOW_NUMERATOR) / NIGHT_SHADOW_DENOMINATOR) as u8,
     ]
 }
 
@@ -132,6 +165,26 @@ mod tests {
         let c = [255u8, 200, 100];
         let s = shade(c);
         assert!(s[0] <= c[0] && s[1] <= c[1] && s[2] <= c[2]);
+    }
+
+    #[test]
+    fn night_darken_darkens_and_keeps_void_black() {
+        assert_eq!(night_darken([100, 200, 50]), [30, 60, 15]);
+        assert_eq!(night_darken(NO_BLOCK), NO_BLOCK);
+
+        let c = [255u8, 200, 100];
+        let d = night_darken(c);
+        assert!(d[0] <= c[0] && d[1] <= c[1] && d[2] <= c[2]);
+    }
+
+    #[test]
+    fn night_shade_is_almost_black() {
+        // Night shadow applied to an already night-darkened color.
+        let darkened = night_darken([200, 180, 160]);
+        let shadowed = night_shade(darkened);
+        // Should be very dark (each channel <= 8% of the night-darkened value).
+        assert!(shadowed[0] <= 21 && shadowed[1] <= 19 && shadowed[2] <= 17);
+        assert_eq!(night_shade(NO_BLOCK), NO_BLOCK);
     }
 
     #[test]

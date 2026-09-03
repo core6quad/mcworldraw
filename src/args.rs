@@ -25,6 +25,7 @@ pub(crate) struct Args {
     pub(crate) ambient_occlusion: bool,
     pub(crate) bloom: bool,
     pub(crate) transparency: bool,
+    pub(crate) night: bool,
 }
 
 impl Args {
@@ -84,6 +85,10 @@ pub(crate) fn print_usage() {
                              is blended with the first non-water block beneath\n\
                              it, so the block under the water is faintly\n\
                              visible\n\
+         -n, --night          Night mode: the world becomes very dark, shadows\n\
+                             become almost pitch black, and bloom (if enabled)\n\
+                             gets larger with more falloff distance so lights\n\
+                             illuminate a wider area\n\
          -h, --help           Show this message"
     );
 }
@@ -101,6 +106,7 @@ pub(crate) fn parse_args() -> Result<Args, String> {
     let mut ambient_occlusion = false;
     let mut bloom = false;
     let mut transparency = false;
+    let mut night = false;
 
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -116,6 +122,7 @@ pub(crate) fn parse_args() -> Result<Args, String> {
             "--ambient-occlusion" | "-ao" => ambient_occlusion = true,
             "--bloom" | "-b" => bloom = true,
             "--transparency" | "-t" => transparency = true,
+            "--night" | "-n" => night = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -194,6 +201,7 @@ pub(crate) fn parse_args() -> Result<Args, String> {
         ambient_occlusion,
         bloom,
         transparency,
+        night,
     })
 }
 
@@ -249,6 +257,7 @@ mod tests {
             ambient_occlusion: false,
             bloom: false,
             transparency: false,
+            night: false,
         };
         assert_eq!(args(false, false).upsample_factor(), None);
         assert_eq!(args(true, false).upsample_factor(), Some(SUPER_SAMPLE));

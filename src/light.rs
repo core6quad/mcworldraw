@@ -14,6 +14,10 @@ use crate::chunk::VOID_H;
 /// at any resolution.
 pub(crate) const BLOOM_RADIUS_BLOCKS: f32 = 2.0;
 
+/// Night mode bloom radius: in whole blocks. Larger than the day
+/// [`BLOOM_RADIUS_BLOCKS`] so lights illuminate a wider area in the dark.
+pub(crate) const NIGHT_BLOOM_RADIUS_BLOCKS: f32 = 6.0;
+
 /// Peak additive strength of a bloom at its source: the full bloom color is
 /// added to the underlying pixel when this is 1.0.
 pub(crate) const BLOOM_STRENGTH: f32 = 1.0;
@@ -206,7 +210,7 @@ pub(crate) fn ambient_occlusion(
 ///
 /// Each source radiates a radial gradient from the centre of its block: the
 /// added color is strongest at the source and fades to zero at
-/// [`BLOOM_RADIUS_BLOCKS`] blocks away, with a smooth quadratic falloff. When
+/// `radius_blocks` blocks away, with a smooth quadratic falloff. When
 /// several sources overlap their amounts add, so a cluster of lights glows
 /// brighter than a lone one.
 pub(crate) fn bloom(
@@ -214,12 +218,13 @@ pub(crate) fn bloom(
     grid_w: usize,
     grid_h: usize,
     s: usize,
+    radius_blocks: f32,
 ) -> Vec<[u8; 3]> {
     let pw = grid_w * s;
     let ph = grid_h * s;
     let mut out = vec![[0u8, 0, 0]; pw * ph];
 
-    let radius_px = (BLOOM_RADIUS_BLOCKS * s as f32) as usize;
+    let radius_px = (radius_blocks * s as f32) as usize;
     if radius_px == 0 {
         return out;
     }
@@ -491,7 +496,7 @@ mod tests {
 
         let pw = grid_w * s;
 
-        let field = bloom(&lights, grid_w, grid_h, s);
+        let field = bloom(&lights, grid_w, grid_h, s, BLOOM_RADIUS_BLOCKS);
 
         // Centre of the light block in pixel coordinates.
         let cx = 2 * s + s / 2; // 10
