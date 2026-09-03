@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -84,6 +85,7 @@ impl Bounds {
 struct Args {
     world_path: String,
     single: bool,
+    scale: u32,
 }
 
 fn print_usage() {
@@ -91,21 +93,40 @@ fn print_usage() {
         "Usage: mcmap <path-to-world> [options]\n\n\
          Renders a top-down map of a Minecraft world from its region files.\n\n\
          Options:\n\
-         -s, --single    Render one big PNG instead of one PNG per chunk\n\
-         -h, --help      Show this message"
+         -s, --single         Render one big PNG instead of one PNG per chunk\n\
+         -z, --scale <N>      Downsample so each pixel is N x N blocks; the\n\
+                              pixel color is the most common block in the area\n\
+                              (1 = one pixel per block, the default)\n\
+         -h, --help           Show this message"
     );
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut world_path: Option<String> = None;
     let mut single = false;
+    let mut scale: u32 = 1;
 
-    for arg in env::args().skip(1) {
-        match arg.as_str() {
+    let raw: Vec<String> = env::args().skip(1).collect();
+    let mut i = 0;
+
+    while i < raw.len() {
+        let arg = raw[i].as_str();
+
+        match arg {
             "--single" | "--big" | "-s" => single = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
+            }
+            "--scale" | "-z" => {
+                i += 1;
+                let value = raw
+                    .get(i)
+                    .ok_or("--scale requires a value (e.g. --scale 2)")?;
+                scale = parse_scale(value)?;
+            }
+            _ if arg.starts_with("--scale=") => {
+                scale = parse_scale(&arg["--scale=".len()..])?;
             }
             other => {
                 if world_path.is_some() {
@@ -114,12 +135,29 @@ fn parse_args() -> Result<Args, String> {
                 world_path = Some(other.to_string());
             }
         }
+
+        i += 1;
     }
 
     let world_path =
         world_path.ok_or_else(|| "Missing <path-to-world> argument".to_string())?;
 
-    Ok(Args { world_path, single })
+    Ok(Args { world_path, single, scale })
+}
+
+/// Parse and validate a `--scale` value: a positive integer (>= 1).
+fn parse_scale(value: &str) -> Result<u32, String> {
+    let scale = value
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid scale value: {value:?}"))?;
+
+    if scale < 1 {
+        return Err(format!(
+            "Scale must be a positive integer (>= 1), got {value}"
+        ));
+    }
+
+    Ok(scale)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -191,23 +229,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.single {
         let bounds = world_bounds.expect("bounds must exist when chunks exist");
 
-        let width = (bounds.max_x - bounds.min_x + 1) * CHUNK_SIZE as i32;
-        let height = (bounds.max_z - bounds.min_z + 1) * CHUNK_SIZE as i32;
+        let scale = args.scale as i32;
+        let blocks_w = (bounds.max_x - bounds.min_x + 1) * (CHUNK_SIZE as i32);
+        let blocks_h = (bounds.max_z - bounds.min_z + 1) * (CHUNK_SIZE as i32);
+
+        // Each output pixel covers `scale x scale` blocks, so the image is
+        // smaller by that factor (rounded up to a whole pixel).
+        let width = (blocks_w + scale - 1) / scale;
+        let height = (blocks_h + scale - 1) / scale;
         let (width, height) = (width as u32, height as u32);
 
         println!(
-            "Found {} region files and {} chunks. Rendering a single {}x{} PNG to {}",
+            "Found {} region files and {} chunks. Rendering a single {}x{} PNG (scale {}) to {}",
             region_files.len(),
             total_chunks,
             width,
             height,
+            args.scale,
             out_dir.display()
         );
 
         let mut img = RgbImage::new(width, height);
 
         for path in &region_files {
-            process_region_single(path, &mut img, bounds.min_x, bounds.min_z, &pb)?;
+            process_region_single(
+                path,
+                &mut img,
+                bounds.min_x,
+                bounds.min_z,
+                args.scale,
+                &pb,
+            )?;
         }
 
         pb.finish_with_message("Done");
@@ -229,7 +281,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     for path in &region_files {
-        process_region(path, out_dir, &pb)?;
+        process_region(path, out_dir, args.scale, &pb)?;
     }
 
     pb.finish_with_message("Done");
@@ -244,6 +296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn process_region(
     path: &Path,
     out_dir: &Path,
+    scale: u32,
     pb: &ProgressBar,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let Some((region_x, region_z)) = parse_region_coords(path) else {
@@ -281,7 +334,7 @@ fn process_region(
             let top = get_top_blocks(&chunk);
 
             let out_path = out_dir.join(format!("c_{chunk_x}_{chunk_z}.png"));
-            render_chunk_png(&top, &out_path)?;
+            render_chunk_png(&top, &out_path, scale)?;
 
             generated += 1;
             pb.inc(1);
@@ -366,27 +419,22 @@ fn parse_region_coords(path: &Path) -> Option<(i32, i32)> {
     Some((x, z))
 }
 
-/// Render the top-down view of a chunk as a 16x16 PNG (1 pixel = 1 block).
+/// Render the top-down view of a chunk as a PNG.
 ///
-/// Pixel (x, z) is colored by the highest non-air block in that column.
+/// At `scale = 1` the output is 16x16 (1 pixel = 1 block) and each pixel is
+/// colored by the highest non-air block in that column. At `scale = N` the
+/// output is `ceil(16 / N)` on each side, and every pixel is colored by the
+/// most common block in its `N x N` area.
 fn render_chunk_png(
     top: &ChunkTop,
     out_path: &Path,
+    scale: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut img = RgbImage::new(CHUNK_SIZE as u32, CHUNK_SIZE as u32);
+    let size = (CHUNK_SIZE + scale as usize - 1) / scale as usize;
 
-    for z in 0..CHUNK_SIZE {
-        for x in 0..CHUNK_SIZE {
-            let i = z * CHUNK_SIZE + x;
+    let mut img = RgbImage::new(size as u32, size as u32);
 
-            let rgb = match &top.blocks[i] {
-                Some(name) => block_color(name),
-                None => NO_BLOCK,
-            };
-
-            img.put_pixel(x as u32, z as u32, Rgb(rgb));
-        }
-    }
+    blit_scaled(&mut img, &top.blocks, CHUNK_SIZE, CHUNK_SIZE, scale, 0, 0);
 
     img.save(out_path)?;
 
@@ -396,24 +444,108 @@ fn render_chunk_png(
 /// Blit a chunk into an already-sized shared image at a given pixel offset.
 ///
 /// `offset_x` / `offset_z` are the pixel coordinates of the chunk's top-left
-/// corner inside the big image (1 pixel = 1 block).
+/// corner inside the big image. At `scale = 1` that is the chunk's block
+/// offset; at `scale = N` it is the chunk's block offset divided by N, and the
+/// chunk is downsampled so each pixel represents an `N x N` block area.
 fn render_into_big(
     img: &mut RgbImage,
     top: &ChunkTop,
     offset_x: u32,
     offset_z: u32,
+    scale: u32,
 ) {
-    for z in 0..CHUNK_SIZE {
-        for x in 0..CHUNK_SIZE {
-            let i = z * CHUNK_SIZE + x;
+    blit_scaled(img, &top.blocks, CHUNK_SIZE, CHUNK_SIZE, scale, offset_x, offset_z);
+}
 
-            let rgb = match &top.blocks[i] {
-                Some(name) => block_color(name),
-                None => NO_BLOCK,
+/// Write a downsampled top-down view of a rectangular block region into
+/// `out`, starting at pixel (`origin_x`, `origin_z`).
+///
+/// `blocks` is a row-major grid of `region_w x region_h` columns (index =
+/// `z * region_w + x`), where each entry is the highest non-air block in that
+/// column, or `None` for void.
+///
+/// At `scale = 1` each output pixel is a single block. At `scale = N` each
+/// output pixel covers an `N x N` block area and is colored by the most common
+/// block in that area (void is ignored; an all-void area is black).
+fn blit_scaled(
+    out: &mut RgbImage,
+    blocks: &[Option<String>],
+    region_w: usize,
+    region_h: usize,
+    scale: u32,
+    origin_x: u32,
+    origin_z: u32,
+) {
+    let scale = scale.max(1) as usize;
+
+    // Fast path: no downsampling, one pixel per block.
+    if scale == 1 {
+        for z in 0..region_h {
+            for x in 0..region_w {
+                let rgb = match &blocks[z * region_w + x] {
+                    Some(name) => block_color(name),
+                    None => NO_BLOCK,
+                };
+                out.put_pixel(origin_x + x as u32, origin_z + z as u32, Rgb(rgb));
+            }
+        }
+        return;
+    }
+
+    let cells_w = (region_w + scale - 1) / scale;
+    let cells_h = (region_h + scale - 1) / scale;
+
+    for cz in 0..cells_h {
+        for cx in 0..cells_w {
+            let x0 = cx * scale;
+            let z0 = cz * scale;
+            let x1 = (x0 + scale).min(region_w);
+            let z1 = (z0 + scale).min(region_h);
+
+            let rgb = most_common_color(blocks, region_w, x0, x1, z0, z1);
+
+            out.put_pixel(origin_x + cx as u32, origin_z + cz as u32, Rgb(rgb));
+        }
+    }
+}
+
+/// Color of the most common block within the block rectangle
+/// `[x0, x1) x [z0, z1)`.
+///
+/// Ties resolve to whichever block reaches the leading count first in
+/// row-major scan order, so the result is deterministic. Returns `NO_BLOCK`
+/// for an all-void area.
+fn most_common_color(
+    blocks: &[Option<String>],
+    region_w: usize,
+    x0: usize,
+    x1: usize,
+    z0: usize,
+    z1: usize,
+) -> [u8; 3] {
+    let mut counts: HashMap<&str, u32> = HashMap::new();
+    let mut best_name: Option<&str> = None;
+    let mut best_count: u32 = 0;
+
+    for z in z0..z1 {
+        for x in x0..x1 {
+            let Some(name) = blocks[z * region_w + x].as_deref() else {
+                continue;
             };
 
-            img.put_pixel(offset_x + x as u32, offset_z + z as u32, Rgb(rgb));
+            let count = counts.entry(name).or_insert(0);
+            *count += 1;
+
+            if *count > best_count {
+                best_count = *count;
+                best_name = Some(name);
+            }
         }
+    }
+
+    match best_name {
+        Some(name) => block_color(name),
+        None => NO_BLOCK,
     }
 }
 
@@ -421,11 +553,14 @@ fn render_into_big(
 ///
 /// `min_chunk_x` / `min_chunk_z` are the world's minimum chunk coordinates,
 /// used to translate each chunk's absolute position into image pixel offsets.
+/// At `scale = 1` the offset is the chunk's block offset; at `scale = N` it is
+/// divided by N because the shared image is downsampled by that factor.
 fn process_region_single(
     path: &Path,
     img: &mut RgbImage,
     min_chunk_x: i32,
     min_chunk_z: i32,
+    scale: u32,
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some((region_x, region_z)) = parse_region_coords(path) else {
@@ -460,10 +595,11 @@ fn process_region_single(
 
             let top = get_top_blocks(&chunk);
 
-            let offset_x = (chunk_x - min_chunk_x) * CHUNK_SIZE as i32;
-            let offset_z = (chunk_z - min_chunk_z) * CHUNK_SIZE as i32;
+            let s = scale as i32;
+            let offset_x = ((chunk_x - min_chunk_x) * (CHUNK_SIZE as i32)) / s;
+            let offset_z = ((chunk_z - min_chunk_z) * (CHUNK_SIZE as i32)) / s;
 
-            render_into_big(img, &top, offset_x as u32, offset_z as u32);
+            render_into_big(img, &top, offset_x as u32, offset_z as u32, scale);
 
             pb.inc(1);
         }
@@ -803,7 +939,7 @@ mod tests {
         };
 
         let path = std::env::temp_dir().join("worldraw_test_chunk.png");
-        render_chunk_png(&top, &path).expect("render should succeed");
+        render_chunk_png(&top, &path, 1).expect("render should succeed");
 
         let img = image::open(&path).expect("png should be readable");
         assert_eq!(img.dimensions(), (16, 16));
@@ -833,8 +969,8 @@ mod tests {
         };
 
         let mut img = RgbImage::new(32, 16);
-        render_into_big(&mut img, &top_a, 0, 0);
-        render_into_big(&mut img, &top_b, 16, 0);
+        render_into_big(&mut img, &top_a, 0, 0, 1);
+        render_into_big(&mut img, &top_b, 16, 0, 1);
 
         assert_eq!(img.dimensions(), (32, 16));
 
@@ -847,6 +983,62 @@ mod tests {
         // Chunk B starts at x=16 and is entirely sand.
         assert_eq!(img.get_pixel(16, 0).0, [219, 209, 160]);
         assert_eq!(img.get_pixel(31, 15).0, [219, 209, 160]);
+    }
+
+    #[test]
+    fn downsamples_by_most_common_block() {
+        // Top-left 2x2 area: three sand + one grass; everything else is void.
+        let mut blocks: [Option<String>; COLUMNS] =
+            std::array::from_fn(|_| None);
+        blocks[0] = Some("minecraft:sand".to_string());
+        blocks[1] = Some("minecraft:sand".to_string());
+        blocks[16] = Some("minecraft:sand".to_string());
+        blocks[17] = Some("minecraft:grass_block".to_string());
+
+        let top = ChunkTop {
+            blocks,
+            heights: [None; COLUMNS],
+        };
+
+        let path = std::env::temp_dir().join("worldraw_test_scaled.png");
+        render_chunk_png(&top, &path, 2).expect("render should succeed");
+
+        let img = image::open(&path).expect("png should be readable");
+        assert_eq!(img.dimensions(), (8, 8));
+
+        // Cell (0, 0) covers the 2x2 area; sand (3) beats grass (1).
+        assert_eq!(img.get_pixel(0, 0).0, [219, 209, 160, 255]);
+        // Every other cell is void (black).
+        assert_eq!(img.get_pixel(1, 0).0, [0, 0, 0, 255]);
+        assert_eq!(img.get_pixel(0, 1).0, [0, 0, 0, 255]);
+        assert_eq!(img.get_pixel(7, 7).0, [0, 0, 0, 255]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scale_four_shrinks_a_16x16_chunk_to_4x4() {
+        // Uniform grass -> the modal block of every 4x4 area is grass.
+        let top = ChunkTop {
+            blocks: std::array::from_fn(|_| {
+                Some("minecraft:grass_block".to_string())
+            }),
+            heights: [None; COLUMNS],
+        };
+
+        let path = std::env::temp_dir().join("worldraw_test_scaled4.png");
+        render_chunk_png(&top, &path, 4).expect("render should succeed");
+
+        let img = image::open(&path).expect("png should be readable");
+        assert_eq!(img.dimensions(), (4, 4));
+
+        for z in 0..4 {
+            for x in 0..4 {
+                assert_eq!(img.get_pixel(x, z).0, [106, 170, 64, 255]);
+            }
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
