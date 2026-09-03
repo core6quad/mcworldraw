@@ -111,6 +111,7 @@ struct Args {
     shadows: bool,
     supersample: bool,
     hypersample: bool,
+    ambient_occlusion: bool,
 }
 
 impl Args {
@@ -153,6 +154,13 @@ fn print_usage() {
                               they are resolved at pixel resolution so their\n\
                               edges stay smooth. Cannot be combined with\n\
                               -ss/--supersample or -z/--scale\n\
+         -ao, --ambient-occlusion Draw a soft black gradient on the edge of a\n\
+                              block whose neighbour stands exactly one block\n\
+                              higher. The gradient covers the outer 1/4 of the\n\
+                              block, is black at the shared edge and fades to\n\
+                              almost invisible toward the block's centre. Only\n\
+                              available together with -ss/--supersample or\n\
+                              -hs/--hypersampling\n\
          -h, --help           Show this message"
     );
 }
@@ -166,6 +174,7 @@ fn parse_args() -> Result<Args, String> {
     let mut shadows = false;
     let mut supersample = false;
     let mut hypersample = false;
+    let mut ambient_occlusion = false;
 
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -178,6 +187,7 @@ fn parse_args() -> Result<Args, String> {
             "--shadows" | "--shadow" | "-r" => shadows = true,
             "--supersample" | "-ss" => supersample = true,
             "--hypersampling" | "--hypersample" | "-hs" => hypersample = true,
+            "--ambient-occlusion" | "-ao" => ambient_occlusion = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -230,11 +240,26 @@ fn parse_args() -> Result<Args, String> {
             "--supersample (-ss) cannot be combined with --scale (-z/--scale)".into(),
         );
     }
+    if ambient_occlusion && !(supersample || hypersample) {
+        return Err(
+            "--ambient-occlusion (-ao) requires --supersample (-ss) or --hypersampling (-hs)"
+                .into(),
+        );
+    }
 
     let world_path =
         world_path.ok_or_else(|| "Missing <path-to-world> argument".to_string())?;
 
-    Ok(Args { world_path, single, scale, dim, shadows, supersample, hypersample })
+    Ok(Args {
+        world_path,
+        single,
+        scale,
+        dim,
+        shadows,
+        supersample,
+        hypersample,
+        ambient_occlusion,
+    })
 }
 
 /// Parse and validate a `--scale` value: a positive integer (>= 1).
@@ -594,7 +619,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut img = RgbImage::new(width, height);
 
-        if args.shadows {
+        if args.shadows || args.ambient_occlusion {
             // Shadow rendering is done over the whole map:
             //
             //   1. One pass over the region files fills two global grids -- the
@@ -634,11 +659,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let pw = grid_w * s;
                 let ph = grid_h * s;
                 let pixel_heights = supersampled_heights(&heights, grid_w, grid_h, s);
-                let pixel_shadow = compute_shadows(&pixel_heights, pw, ph);
+                let pixel_shadow = if args.shadows {
+                    Some(compute_shadows(&pixel_heights, pw, ph))
+                } else {
+                    None
+                };
                 drop(pixel_heights);
+                let pixel_ao = if args.ambient_occlusion {
+                    Some(ambient_occlusion(&heights, grid_w, grid_h, s))
+                } else {
+                    None
+                };
                 drop(heights);
 
-                render_shaded_map_ss(&mut img, &colors, &pixel_shadow, grid_w, grid_h, s);
+                render_ss(
+                    &mut img,
+                    &colors,
+                    pixel_shadow.as_deref(),
+                    pixel_ao.as_deref(),
+                    grid_w,
+                    grid_h,
+                    s,
+                );
             } else {
                 let shadow = compute_shadows(&heights, grid_w, grid_h);
                 drop(heights);
@@ -711,6 +753,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.scale,
             args.upsample_factor().unwrap_or(1),
             dim.out_prefix,
+            args.ambient_occlusion,
             &pb,
         )?;
     }
@@ -730,6 +773,7 @@ fn process_region(
     scale: u32,
     upsample: u32,
     dim_prefix: &str,
+    ambient_occlusion: bool,
     pb: &ProgressBar,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let Some((region_x, region_z)) = parse_region_coords(path) else {
@@ -769,7 +813,11 @@ fn process_region(
             let out_path =
                 out_dir.join(format!("{dim_prefix}c_{chunk_x}_{chunk_z}.png"));
             if upsample > 1 {
-                render_chunk_png_ss(&top, &out_path, upsample)?;
+                if ambient_occlusion {
+                    render_chunk_png_ss_ao(&top, &out_path, upsample)?;
+                } else {
+                    render_chunk_png_ss(&top, &out_path, upsample)?;
+                }
             } else {
                 render_chunk_png(&top, &out_path, scale)?;
             }
@@ -995,6 +1043,83 @@ fn render_chunk_png_ss(
     img.save(out_path)?;
 
     Ok(())
+}
+
+/// Render the top-down view of a chunk as a supersampled PNG with ambient
+/// occlusion: each of the 16x16 blocks becomes a solid `scale x scale` pixel
+/// square (as in [`render_chunk_png_ss`]), but each block's edge facing a
+/// neighbour that is one block higher gets a soft black gradient (see
+/// [`ambient_occlusion`]).
+///
+/// AO is computed from the chunk's own columns, so the effect is correct
+/// within the chunk; the outermost edge blocks cannot see neighbours that
+/// belong to other chunks.
+fn render_chunk_png_ss_ao(
+    top: &ChunkTop,
+    out_path: &Path,
+    scale: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let s = scale as usize;
+    let size = CHUNK_SIZE * s;
+    let mut img = RgbImage::new(size as u32, size as u32);
+
+    // Reuse the global AO routine on this chunk's 16x16 height grid (void
+    // columns keep the VOID_H sentinel so they neither cast nor receive).
+    let heights: Vec<i32> =
+        top.heights.iter().map(|h| h.unwrap_or(VOID_H)).collect();
+    let ao = ambient_occlusion(&heights, CHUNK_SIZE, CHUNK_SIZE, s);
+
+    blit_supersampled_ao(
+        &mut img,
+        &top.blocks,
+        CHUNK_SIZE,
+        CHUNK_SIZE,
+        s,
+        &ao,
+        0,
+        0,
+    );
+
+    img.save(out_path)?;
+
+    Ok(())
+}
+
+/// Like [`blit_supersampled`], but each block's `s x s` pixels are additionally
+/// darkened toward black according to a pixel-resolution `ao` field (0.0..=1.0,
+/// sized `region_w * s x region_h * s`, index = `z * region_w * s + x * s +`
+/// pixel offset).
+fn blit_supersampled_ao(
+    out: &mut RgbImage,
+    blocks: &[Option<String>],
+    region_w: usize,
+    region_h: usize,
+    s: usize,
+    ao: &[f32],
+    origin_x: u32,
+    origin_z: u32,
+) {
+    let s = s.max(1);
+    let pw = region_w * s;
+    for z in 0..region_h {
+        for x in 0..region_w {
+            let rgb = match &blocks[z * region_w + x] {
+                Some(name) => block_color(name),
+                None => NO_BLOCK,
+            };
+            let base_x = origin_x + (x as u32) * (s as u32);
+            let base_z = origin_z + (z as u32) * (s as u32);
+            for dz in 0..s as u32 {
+                for dx in 0..s as u32 {
+                    let px = base_x + dx;
+                    let pz = base_z + dz;
+                    let pi = (pz as usize) * pw + (px as usize);
+                    let rgb = apply_ao(rgb, ao[pi]);
+                    out.put_pixel(px, pz, Rgb(rgb));
+                }
+            }
+        }
+    }
 }
 
 /// Color of the most common block within the block rectangle
@@ -1261,20 +1386,23 @@ fn render_shaded_map(
     }
 }
 
-/// Supersample shadow pass: fill `img` (sized `grid_w * s x grid_h * s`) from
-/// the block-resolution `colors` grid and a pixel-resolution `pixel_shadow`
-/// mask.
+/// General supersampled fill: draw every block as a solid `s x s` pixel square
+/// of its base color (no interpolation between blocks), optionally darkening
+/// each pixel independently by an elevation shadow (`bool`) and/or an
+/// ambient-occlusion amount (`f32`, 0.0 = no darkening, 1.0 = fully black).
 ///
-/// Every block is drawn as a solid `s x s` pixel square of its base color
-/// (no interpolation between blocks), but each of its pixels is darkened
-/// independently according to `pixel_shadow`. Because the shadow was computed
-/// at pixel resolution (see [`supersampled_heights`]), a block straddling the
-/// shadow edge gets a mix of lit and dark pixels, which renders the diagonal
-/// shadow boundary smoothly instead of as a coarse stairstep of blocks.
-fn render_shaded_map_ss(
+/// When `pixel_shadow` is provided it is a pixel-resolution mask (see
+/// [`supersampled_heights`]), so a block straddling the shadow edge gets a mix
+/// of lit and dark pixels and the diagonal shadow boundary stays smooth. When
+/// `pixel_ao` is provided it is a per-pixel darkening amount. Both masks, when
+/// present, are sized `grid_w * s x grid_h * s` (index = `z * grid_w * s +`
+/// `x * s +` pixel offset). Shadow is applied first, then AO, so the two
+/// compose.
+fn render_ss(
     img: &mut RgbImage,
     colors: &[[u8; 3]],
-    pixel_shadow: &[bool],
+    pixel_shadow: Option<&[bool]>,
+    pixel_ao: Option<&[f32]>,
     grid_w: usize,
     grid_h: usize,
     s: usize,
@@ -1292,12 +1420,123 @@ fn render_shaded_map_ss(
                     let px = base_x + dx;
                     let pz = base_z + dz;
                     let pi = pz * pw + px;
-                    let rgb = if pixel_shadow[pi] { shade(c) } else { c };
+                    let mut rgb = c;
+                    if let Some(shadow) = pixel_shadow {
+                        if shadow[pi] {
+                            rgb = shade(rgb);
+                        }
+                    }
+                    if let Some(ao) = pixel_ao {
+                        let a = ao[pi];
+                        if a > 0.0 {
+                            rgb = apply_ao(rgb, a);
+                        }
+                    }
                     img.put_pixel(px as u32, pz as u32, Rgb(rgb));
                 }
             }
         }
     }
+}
+
+/// Blend a color toward black by `amount` (0.0 = unchanged, 1.0 = black) for
+/// ambient occlusion.
+fn apply_ao(rgb: [u8; 3], amount: f32) -> [u8; 3] {
+    let keep = 1.0 - amount.clamp(0.0, 1.0);
+    [
+        (rgb[0] as f32 * keep) as u8,
+        (rgb[1] as f32 * keep) as u8,
+        (rgb[2] as f32 * keep) as u8,
+    ]
+}
+
+/// Compute a per-pixel ambient-occlusion darkening field for a supersampled
+/// map, in the range 0.0 (no darkening) to 1.0 (fully black).
+///
+/// `heights` is a row-major `grid_w x grid_h` grid of block-resolution column
+/// surface heights (index = `z * grid_w + x`), where [`VOID_H`] marks a void
+/// column. For every block, each orthogonal neighbour that stands exactly one
+/// block higher casts a soft gradient onto the facing edge of this (lower)
+/// block. The gradient covers the outer `s / 4` pixels of the block, is fully
+/// black at the shared edge and fades linearly to (almost) transparent toward
+/// the block's centre. When several neighbours apply, the strongest darkening
+/// at a pixel wins.
+fn ambient_occlusion(
+    heights: &[i32],
+    grid_w: usize,
+    grid_h: usize,
+    s: usize,
+) -> Vec<f32> {
+    let pw = grid_w * s;
+    let mut out = vec![0.0f32; pw * (grid_h * s)];
+
+    // How many pixels from each edge the gradient reaches: 1/4 of a block.
+    let band = s / 4;
+    if band == 0 {
+        return out;
+    }
+
+    for z in 0..grid_h {
+        for x in 0..grid_w {
+            let h = heights[z * grid_w + x];
+            if h == VOID_H {
+                continue;
+            }
+
+            // Which of the four edges faces a neighbour exactly one block up.
+            // Order: top (z-1), bottom (z+1), left (x-1), right (x+1).
+            let mut sides = [false; 4];
+            if z >= 1 && heights[(z - 1) * grid_w + x] == h + 1 {
+                sides[0] = true;
+            }
+            if z + 1 < grid_h && heights[(z + 1) * grid_w + x] == h + 1 {
+                sides[1] = true;
+            }
+            if x >= 1 && heights[z * grid_w + (x - 1)] == h + 1 {
+                sides[2] = true;
+            }
+            if x + 1 < grid_w && heights[z * grid_w + (x + 1)] == h + 1 {
+                sides[3] = true;
+            }
+            if !sides.iter().any(|b| *b) {
+                continue;
+            }
+
+            let base_x = x * s;
+            let base_z = z * s;
+
+            for dz in 0..s {
+                // Distance from each edge, in pixels.
+                let d_top = dz;
+                let d_bottom = s - 1 - dz;
+                for dx in 0..s {
+                    let d_left = dx;
+                    let d_right = s - 1 - dx;
+
+                    let mut dark = 0.0f32;
+                    if sides[0] && d_top < band {
+                        dark = dark.max(1.0 - d_top as f32 / band as f32);
+                    }
+                    if sides[1] && d_bottom < band {
+                        dark = dark.max(1.0 - d_bottom as f32 / band as f32);
+                    }
+                    if sides[2] && d_left < band {
+                        dark = dark.max(1.0 - d_left as f32 / band as f32);
+                    }
+                    if sides[3] && d_right < band {
+                        dark = dark.max(1.0 - d_right as f32 / band as f32);
+                    }
+
+                    if dark > 0.0 {
+                        let pi = (base_z + dz) * pw + (base_x + dx);
+                        out[pi] = dark;
+                    }
+                }
+            }
+        }
+    }
+
+    out
 }
 
 /// Write a chunk's per-block display colors into `out`, starting at pixel
@@ -2193,7 +2432,7 @@ mod tests {
         let pixel_shadow = compute_shadows(&pixel_heights, pw, ph);
 
         let mut img = RgbImage::new((grid_w * s) as u32, (grid_h * s) as u32);
-        render_shaded_map_ss(&mut img, &colors, &pixel_shadow, grid_w, grid_h, s);
+        render_ss(&mut img, &colors, Some(&pixel_shadow), None, grid_w, grid_h, s);
 
         let lit = block_color("minecraft:sand");
         let dark = shade(lit);
@@ -2272,6 +2511,7 @@ mod tests {
             shadows: false,
             supersample,
             hypersample,
+            ambient_occlusion: false,
         };
         assert_eq!(args(false, false).upsample_factor(), None);
         assert_eq!(args(true, false).upsample_factor(), Some(SUPER_SAMPLE));
@@ -2322,6 +2562,134 @@ mod tests {
             found_partial,
             "a block should straddle the smooth shadow edge at pixel resolution"
         );
+    }
+
+    #[test]
+    fn ambient_occlusion_fades_from_edge_to_centre_on_the_lower_block() {
+        // 2x1 block grid: left block height 0, right block height 1.
+        // Only the left (lower) block receives a gradient, on the edge facing
+        // the higher (right) block.
+        let grid_w = 2;
+        let grid_h = 1;
+        let heights = vec![0i32, 1]; // index = z * grid_w + x
+        let s = 16usize; // band = s / 4 = 4 pixels
+        let pw = grid_w * s;
+        let ao = ambient_occlusion(&heights, grid_w, grid_h, s);
+
+        // Left block, right edge (dx = s - 1, the shared edge): fully black.
+        let edge = ao[0 * pw + (s - 1)];
+        assert!(edge > 0.99, "edge should be near-black, got {edge}");
+
+        // Moving toward the centre the darkening strictly decreases.
+        let inner = ao[0 * pw + (s - 1 - 3)]; // 3 px in -> 1 - 3/4 = 0.25
+        assert!(inner < edge, "gradient should fade inward");
+        assert!((inner - 0.25).abs() < 1e-6, "expected 0.25, got {inner}");
+
+        // Past the 1/4 band (>= band px from the edge) there is no darkening.
+        let beyond = ao[0 * pw + (s - 1 - 4)];
+        assert_eq!(beyond, 0.0);
+
+        // Well inside the lower block there is no darkening at all.
+        assert_eq!(ao[0 * pw + 0], 0.0);
+
+        // The higher (right) block receives no gradient (it is the higher one).
+        for dx in 0..s {
+            assert_eq!(ao[0 * pw + s + dx], 0.0);
+        }
+    }
+
+    #[test]
+    fn ambient_occlusion_requires_exactly_one_block_of_difference() {
+        let grid_w = 2;
+        let grid_h = 1;
+        let s = 16usize;
+        let pw = grid_w * s;
+
+        // Same height on both sides: no AO anywhere.
+        let flat = vec![5i32, 5];
+        assert!(ambient_occlusion(&flat, grid_w, grid_h, s).iter().all(|v| *v == 0.0));
+
+        // Neighbour two blocks higher (not one): no AO anywhere.
+        let steep = vec![5i32, 7];
+        assert!(ambient_occlusion(&steep, grid_w, grid_h, s).iter().all(|v| *v == 0.0));
+
+        // Neighbour exactly one block higher: the lower block's facing edge is dark.
+        let one = vec![5i32, 6];
+        let ao = ambient_occlusion(&one, grid_w, grid_h, s);
+        assert!(ao[0 * pw + (s - 1)] > 0.99, "1-block step should produce AO");
+    }
+
+    #[test]
+    fn ambient_occlusion_ignores_void_columns() {
+        // A real block next to a void column: void has no height, so no AO.
+        let grid_w = 2;
+        let grid_h = 1;
+        let s = 16usize;
+        let heights = vec![5i32, VOID_H];
+        let ao = ambient_occlusion(&heights, grid_w, grid_h, s);
+        assert!(ao.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn render_ss_applies_ambient_occlusion_gradient() {
+        let grid_w = 2;
+        let grid_h = 1;
+        let s = 16usize;
+        let heights = vec![0i32, 1];
+        let colors = vec![
+            block_color("minecraft:sand"),
+            block_color("minecraft:sand"),
+        ];
+        let ao = ambient_occlusion(&heights, grid_w, grid_h, s);
+
+        let mut img = RgbImage::new((grid_w * s) as u32, (grid_h * s) as u32);
+        render_ss(&mut img, &colors, None, Some(&ao), grid_w, grid_h, s);
+
+        let lit = block_color("minecraft:sand");
+        // The lower block's edge pixel (facing the higher block) is darkened.
+        let edge = img.get_pixel((s - 1) as u32, 0).0;
+        assert!(
+            edge[0] < lit[0] && edge[1] < lit[1] && edge[2] < lit[2],
+            "edge should be darker than the lit color"
+        );
+        // The higher block is unchanged.
+        assert_eq!(img.get_pixel((s + s / 2) as u32, 0).0, lit);
+    }
+
+    #[test]
+    fn chunk_png_supersampled_with_ao_darkens_the_lower_edge() {
+        // A 16x16 chunk: block (x=0, z=0) at height 0, block (x=1, z=0) at
+        // height 1, everything else void. The lower block's right edge should
+        // be darkened, the higher block should stay lit.
+        let mut blocks: [Option<String>; COLUMNS] =
+            std::array::from_fn(|_| None);
+        let mut heights: [Option<i32>; COLUMNS] = [None; COLUMNS];
+        blocks[0] = Some("minecraft:sand".to_string());
+        heights[0] = Some(0);
+        blocks[1] = Some("minecraft:sand".to_string());
+        heights[1] = Some(1);
+
+        let top = ChunkTop { blocks, heights };
+        let path = std::env::temp_dir().join("worldraw_test_ao.png");
+        render_chunk_png_ss_ao(&top, &path, 16)
+            .expect("render should succeed");
+
+        let img = image::open(&path).expect("png should be readable");
+        let s = 16u32;
+        let lit = [219u8, 209, 160, 255]; // sand (RGBA)
+
+        // Higher block (x=1) centre stays fully lit.
+        assert_eq!(img.get_pixel(s + s / 2, s / 2).0, lit);
+        // Lower block (x=0) right edge is darkened.
+        let edge = img.get_pixel(s - 1, s / 2).0;
+        assert!(
+            edge[0] < lit[0] && edge[1] < lit[1] && edge[2] < lit[2],
+            "lower block's facing edge should be darkened, got {edge:?}"
+        );
+        // Lower block far from the edge stays lit.
+        assert_eq!(img.get_pixel(0, s / 2).0, lit);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
 
