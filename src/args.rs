@@ -32,6 +32,10 @@ impl Args {
     /// Pixels-per-block upsample factor: `Some(15)` for `--hypersampling`,
     /// `Some(5)` for `--supersample`, or `None` for native / `--scale` mode
     /// (in which case [`Args::scale`] applies instead).
+    ///
+    /// Only exercised by the unit tests below, so allow the dead-code warning
+    /// in non-test (binary) builds.
+    #[allow(dead_code)]
     pub(crate) fn upsample_factor(&self) -> Option<u32> {
         if self.hypersample {
             Some(HYPER_SAMPLE)

@@ -9,3 +9,5 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 indicatif = "0.17"
 mca = "2.1.2"
 serde = { version = "1", features = ["derive"] }
+tiny_http = "0.12"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
