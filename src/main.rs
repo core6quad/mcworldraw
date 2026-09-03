@@ -15,6 +15,18 @@ const COLUMNS: usize = 256;
 /// Color used for columns that have no non-air block (i.e. pure void).
 const NO_BLOCK: [u8; 3] = [0, 0, 0];
 
+/// Sentinel surface height for a column that has no block (pure void).
+///
+/// Real column heights are actual Minecraft Y values, so a value far below any
+/// possible Y marks "no block" without colliding with real terrain. Used by the
+/// shadow pass so void columns neither cast nor receive a shadow.
+const VOID_H: i32 = -1_000_000;
+
+/// How strongly a shadowed surface is darkened: each RGB channel is multiplied
+/// by `SHADOW_NUMERATOR / SHADOW_DENOMINATOR`.
+const SHADOW_NUMERATOR: u32 = 55;
+const SHADOW_DENOMINATOR: u32 = 100;
+
 #[derive(Debug, Deserialize)]
 struct Chunk {
     #[serde(default)]
@@ -52,11 +64,10 @@ struct ChunkTop {
     /// Minecraft block name, e.g. "minecraft:grass_block"
     blocks: [Option<String>; COLUMNS],
 
-    /// Absolute Minecraft Y coordinate.
+    /// Absolute Minecraft Y coordinate of the top block (the column's surface
+    /// height), or `None` for a void column.
     ///
-    /// Retained for potential future elevation-based shading; not currently
-    /// used by the renderer.
-    #[allow(dead_code)]
+    /// Used by the shadow pass to compute elevation-based shadows.
     heights: [Option<i32>; COLUMNS],
 }
 
@@ -87,6 +98,7 @@ struct Args {
     single: bool,
     scale: u32,
     dim: i32,
+    shadows: bool,
 }
 
 fn print_usage() {
@@ -100,6 +112,9 @@ fn print_usage() {
                               (1 = one pixel per block, the default)\n\
          -d, --dim <N>        Dimension id to render: 0 = overworld (default),\n\
                               1 = the nether, -1 = the end\n\
+         -r, --shadows        Render diagonal elevation shadows as if the sun\n\
+                              were 45 degrees up at the top-right (only applies\n\
+                              in single mode, i.e. together with -s)\n\
          -h, --help           Show this message"
     );
 }
@@ -109,6 +124,7 @@ fn parse_args() -> Result<Args, String> {
     let mut single = false;
     let mut scale: u32 = 1;
     let mut dim: i32 = 0;
+    let mut shadows = false;
 
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -118,6 +134,7 @@ fn parse_args() -> Result<Args, String> {
 
         match arg {
             "--single" | "--big" | "-s" => single = true,
+            "--shadows" | "--shadow" | "-r" => shadows = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -156,7 +173,7 @@ fn parse_args() -> Result<Args, String> {
     let world_path =
         world_path.ok_or_else(|| "Missing <path-to-world> argument".to_string())?;
 
-    Ok(Args { world_path, single, scale, dim })
+    Ok(Args { world_path, single, scale, dim, shadows })
 }
 
 /// Parse and validate a `--scale` value: a positive integer (>= 1).
@@ -482,8 +499,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let height = (blocks_h + scale - 1) / scale;
         let (width, height) = (width as u32, height as u32);
 
+        let shadows_note = if args.shadows { " with shadows" } else { "" };
         println!(
-            "Found {} region files and {} chunks in {} ({}). Rendering a single {}x{} PNG (scale {}) to {}",
+            "Found {} region files and {} chunks in {} ({}). Rendering a single {}x{} PNG (scale {}){shadows_note} to {}",
             region_files.len(),
             total_chunks,
             region_path.display(),
@@ -496,15 +514,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut img = RgbImage::new(width, height);
 
-        for path in &region_files {
-            process_region_single(
-                path,
+        if args.shadows {
+            // Shadow rendering is done over the whole map at block resolution:
+            //
+            //   1. One pass over the region files fills two global grids -- the
+            //      surface height and the base top-down color of every block
+            //      column inside the world bounding box.
+            //   2. A single scan works out, for every column, whether a 45
+            //      degree sun sitting at the top-right is blocked by something
+            //      up-right of it, i.e. whether the column is in shadow.
+            //   3. The image is filled in-memory from those grids, darkening
+            //      shadowed columns. No second region read is needed.
+            let grid_w = blocks_w as usize;
+            let grid_h = blocks_h as usize;
+            let n = grid_w * grid_h;
+
+            let mut heights = vec![VOID_H; n];
+            let mut colors = vec![NO_BLOCK; n];
+
+            for path in &region_files {
+                collect_grid(
+                    path,
+                    &mut heights,
+                    &mut colors,
+                    grid_w,
+                    bounds.min_x,
+                    bounds.min_z,
+                    &pb,
+                )?;
+            }
+
+            let shadow = compute_shadows(&heights, grid_w, grid_h);
+            drop(heights);
+
+            render_shaded_map(
                 &mut img,
+                &colors,
+                &shadow,
+                grid_w,
                 bounds.min_x,
                 bounds.min_z,
+                bounds.max_x,
+                bounds.max_z,
                 args.scale,
-                &pb,
-            )?;
+            );
+        } else {
+            for path in &region_files {
+                process_region_single(
+                    path,
+                    &mut img,
+                    bounds.min_x,
+                    bounds.min_z,
+                    args.scale,
+                    &pb,
+                )?;
+            }
         }
 
         pb.finish_with_message("Done");
@@ -516,6 +580,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Generated chunks: {total_chunks}");
         println!("Output: {}", out_path.display());
         return Ok(());
+    }
+
+    if args.shadows {
+        println!("Note: -r/--shadows only applies in single mode (-s); ignoring it here.");
     }
 
     println!(
@@ -796,6 +864,276 @@ fn most_common_color(
         Some(name) => block_color(name),
         None => NO_BLOCK,
     }
+}
+
+/// Darken a color to its "in shadow" appearance by scaling every channel by
+/// [`SHADOW_NUMERATOR`] / [`SHADOW_DENOMINATOR`].
+fn shade(rgb: [u8; 3]) -> [u8; 3] {
+    [
+        ((rgb[0] as u32 * SHADOW_NUMERATOR) / SHADOW_DENOMINATOR) as u8,
+        ((rgb[1] as u32 * SHADOW_NUMERATOR) / SHADOW_DENOMINATOR) as u8,
+        ((rgb[2] as u32 * SHADOW_NUMERATOR) / SHADOW_DENOMINATOR) as u8,
+    ]
+}
+
+/// Compute a per-column shadow mask for a top-down map lit by a 45 degree sun
+/// located at the top-right.
+///
+/// `heights` is a row-major grid of `grid_w x grid_h` column surface heights
+/// (index = `z * grid_w + x`), where [`VOID_H`] marks a column with no block.
+/// The result is a same-sized mask that is `true` where the column is in
+/// shadow.
+///
+/// A 45 degree sun at the top-right sends light down toward the bottom-left,
+/// so a column throws a diagonal shadow onto the columns below and to its
+/// left. Because the light arrives at 45 degrees, the horizontal reach of the
+/// shadow equals the height difference: a pillar that stands `N` blocks above
+/// its surroundings casts a diagonal shadow `N` cells long.
+///
+/// Formally, column `(x, z)` is shadowed when some column further up its
+/// diagonal -- `(x + t, z - t)` for `t >= 1` -- rises at least to the height
+/// the light ray would be at that point, i.e. `h(x + t, z - t) >= h(x, z) + t`.
+fn compute_shadows(heights: &[i32], grid_w: usize, grid_h: usize) -> Vec<bool> {
+    let n = grid_w * grid_h;
+    let mut shadow = vec![false; n];
+    // `best[i]` = max over t >= 0 of (height of the diagonal cell t steps
+    // up-right, minus t). It satisfies the recurrence
+    //     best[i] = max(heights[i], best[up_right(i)] - 1)
+    // and is computed scanning from the top-right toward the bottom-left so
+    // the up-right dependency is already resolved when we reach `i`.
+    let mut best = vec![VOID_H; n];
+
+    for z in 0..grid_h {
+        for x in (0..grid_w).rev() {
+            let i = z * grid_w + x;
+            let h = heights[i];
+
+            // The up-right neighbour of (x, z) is (x + 1, z - 1).
+            let up_val = if x + 1 < grid_w && z >= 1 {
+                best[(z - 1) * grid_w + (x + 1)] - 1
+            } else {
+                VOID_H - 1
+            };
+
+            best[i] = if up_val > h { up_val } else { h };
+
+            // A real (non-void) column is in shadow when something up-right of
+            // it reaches at least as high as the ray would be at its position.
+            if h != VOID_H && up_val >= h {
+                shadow[i] = true;
+            }
+        }
+    }
+
+    shadow
+}
+
+/// First shadow pass: read every region once and fill the global height and
+/// base-color grids for the whole world bounding box.
+///
+/// `heights` and `colors` are pre-sized to `grid_w * grid_h` and indexed as
+/// `z * grid_w + x`, where (x, z) are block offsets from
+/// (`min_chunk_x * 16`, `min_chunk_z * 16`). Columns are written to their
+/// absolute position, so the region iteration order does not matter.
+fn collect_grid(
+    path: &Path,
+    heights: &mut [i32],
+    colors: &mut [[u8; 3]],
+    grid_w: usize,
+    min_chunk_x: i32,
+    min_chunk_z: i32,
+    pb: &ProgressBar,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some((region_x, region_z)) = parse_region_coords(path) else {
+        eprintln!("Skipping invalid region filename: {}", path.display());
+        return Ok(());
+    };
+
+    let data = fs::read(path)?;
+
+    // Empty (0-byte) region files show up frequently as placeholders, and
+    // some may be malformed. Skip them instead of aborting the whole run.
+    let mut region = match RegionReader::new(&data) {
+        Ok(region) => region,
+        Err(e) => {
+            eprintln!("Skipping region {}: {e}", path.display());
+            return Ok(());
+        }
+    };
+
+    pb.set_message(format!("r.{region_x}.{region_z}"));
+
+    for local_z in 0..32u8 {
+        for local_x in 0..32u8 {
+            let Some(chunk_data) = region.chunk(local_x, local_z)? else {
+                continue;
+            };
+
+            let chunk_x = region_x * 32 + local_x as i32;
+            let chunk_z = region_z * 32 + local_z as i32;
+
+            let chunk: Chunk = from_bytes(chunk_data)?;
+            let top = get_top_blocks(&chunk);
+
+            let block_x0 = (chunk_x - min_chunk_x) * (CHUNK_SIZE as i32);
+            let block_z0 = (chunk_z - min_chunk_z) * (CHUNK_SIZE as i32);
+
+            for lz in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    let gx = (block_x0 + lx as i32) as usize;
+                    let gz = (block_z0 + lz as i32) as usize;
+                    let gi = gz * grid_w + gx;
+
+                    match &top.blocks[lz * CHUNK_SIZE + lx] {
+                        Some(name) => {
+                            heights[gi] =
+                                top.heights[lz * CHUNK_SIZE + lx].unwrap_or(VOID_H);
+                            colors[gi] = block_color(name);
+                        }
+                        None => {
+                            heights[gi] = VOID_H;
+                            colors[gi] = NO_BLOCK;
+                        }
+                    }
+                }
+            }
+
+            pb.inc(1);
+        }
+    }
+
+    Ok(())
+}
+
+/// Final shadow pass: fill `img` from the global `colors` + `shadow` grids,
+/// darkening shadowed columns.
+///
+/// Every chunk in the world bounding box is blitted at the same pixel offset
+/// the non-shadow single-mode pass uses, so the two modes share an identical
+/// layout. Chunks that do not exist are all void in the grids and therefore
+/// blit as black -- exactly the image's initial state.
+fn render_shaded_map(
+    img: &mut RgbImage,
+    colors: &[[u8; 3]],
+    shadow: &[bool],
+    grid_w: usize,
+    min_chunk_x: i32,
+    min_chunk_z: i32,
+    max_chunk_x: i32,
+    max_chunk_z: i32,
+    scale: u32,
+) {
+    for cz in min_chunk_z..=max_chunk_z {
+        for cx in min_chunk_x..=max_chunk_x {
+            let block_x0 = (cx - min_chunk_x) * (CHUNK_SIZE as i32);
+            let block_z0 = (cz - min_chunk_z) * (CHUNK_SIZE as i32);
+
+            // This chunk's 16x16 display colors, with shadow already applied.
+            let mut local: Vec<[u8; 3]> = Vec::with_capacity(COLUMNS);
+            for lz in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    let gx = block_x0 as usize + lx;
+                    let gz = block_z0 as usize + lz;
+                    let gi = gz * grid_w + gx;
+                    let c = colors[gi];
+                    local.push(if shadow[gi] { shade(c) } else { c });
+                }
+            }
+
+            let offset_x = (block_x0 / scale as i32) as u32;
+            let offset_z = (block_z0 / scale as i32) as u32;
+            blit_scaled_shaded(
+                img,
+                &local,
+                CHUNK_SIZE,
+                CHUNK_SIZE,
+                scale,
+                offset_x,
+                offset_z,
+            );
+        }
+    }
+}
+
+/// Write a chunk's per-block display colors into `out`, starting at pixel
+/// (`origin_x`, `origin_z`), mirroring [`blit_scaled`]'s layout.
+///
+/// `colors` is a row-major `region_w x region_h` grid of display colors where
+/// a void column is already stored as [`NO_BLOCK`]. At `scale = 1` each output
+/// pixel is one block; at `scale = N` each pixel is the most common non-void
+/// display color in its `N x N` block area.
+fn blit_scaled_shaded(
+    out: &mut RgbImage,
+    colors: &[[u8; 3]],
+    region_w: usize,
+    region_h: usize,
+    scale: u32,
+    origin_x: u32,
+    origin_z: u32,
+) {
+    let scale = scale.max(1) as usize;
+
+    if scale == 1 {
+        for z in 0..region_h {
+            for x in 0..region_w {
+                let rgb = colors[z * region_w + x];
+                out.put_pixel(origin_x + x as u32, origin_z + z as u32, Rgb(rgb));
+            }
+        }
+        return;
+    }
+
+    let cells_w = (region_w + scale - 1) / scale;
+    let cells_h = (region_h + scale - 1) / scale;
+
+    for cz in 0..cells_h {
+        for cx in 0..cells_w {
+            let x0 = cx * scale;
+            let z0 = cz * scale;
+            let x1 = (x0 + scale).min(region_w);
+            let z1 = (z0 + scale).min(region_h);
+
+            let rgb = most_common_shaded_color(colors, region_w, x0, x1, z0, z1);
+            out.put_pixel(origin_x + cx as u32, origin_z + cz as u32, Rgb(rgb));
+        }
+    }
+}
+
+/// Display color of the most common (non-void) block in the block rectangle
+/// `[x0, x1) x [z0, z1)`, mirroring [`most_common_color`]'s tie-breaking.
+///
+/// [`NO_BLOCK`] (void) entries are ignored; an all-void area returns
+/// [`NO_BLOCK`].
+fn most_common_shaded_color(
+    colors: &[[u8; 3]],
+    region_w: usize,
+    x0: usize,
+    x1: usize,
+    z0: usize,
+    z1: usize,
+) -> [u8; 3] {
+    let mut counts: HashMap<[u8; 3], u32> = HashMap::new();
+    let mut best: Option<[u8; 3]> = None;
+    let mut best_count: u32 = 0;
+
+    for z in z0..z1 {
+        for x in x0..x1 {
+            let rgb = colors[z * region_w + x];
+            if rgb == NO_BLOCK {
+                continue;
+            }
+
+            let count = counts.entry(rgb).or_insert(0);
+            *count += 1;
+
+            if *count > best_count {
+                best_count = *count;
+                best = Some(rgb);
+            }
+        }
+    }
+
+    best.unwrap_or(NO_BLOCK)
 }
 
 /// Decode a region and composite each of its chunks into a shared big image.
@@ -1360,6 +1698,81 @@ mod tests {
         assert_eq!(parse_dim("-1"), Ok(-1));
         assert!(parse_dim("abc").is_err());
         assert!(parse_dim("1.5").is_err());
+    }
+
+    #[test]
+    fn flat_terrain_casts_no_shadow() {
+        let grid_w = 8;
+        let grid_h = 8;
+        let heights = vec![5i32; grid_w * grid_h];
+        let shadow = compute_shadows(&heights, grid_w, grid_h);
+        assert!(shadow.iter().all(|&s| !s), "flat terrain has no shadow");
+    }
+
+    #[test]
+    fn pillar_casts_a_diagonal_shadow_toward_bottom_left() {
+        let grid_w = 8;
+        let grid_h = 8;
+        // Flat field at height 0 with a single pillar of height 3 at (x=4, z=1).
+        let mut heights = vec![0i32; grid_w * grid_h];
+        heights[1 * grid_w + 4] = 3;
+
+        let shadow = compute_shadows(&heights, grid_w, grid_h);
+        let idx = |x: usize, z: usize| z * grid_w + x;
+
+        // The shadow runs diagonally toward the bottom-left, one cell per block
+        // of height difference: exactly (3,2), (2,3) and (1,4).
+        assert!(shadow[idx(3, 2)], "first shadow cell");
+        assert!(shadow[idx(2, 3)], "second shadow cell");
+        assert!(shadow[idx(1, 4)], "third shadow cell");
+        // The fourth diagonal cell is beyond the 3-block reach and is lit.
+        assert!(!shadow[idx(0, 5)], "beyond the shadow length");
+        // The pillar top and its right / south sides are not shadowed.
+        assert!(!shadow[idx(4, 1)], "pillar top is lit");
+        assert!(!shadow[idx(4, 2)], "south of the pillar is lit");
+        assert!(!shadow[idx(5, 1)], "right of the pillar is lit");
+        // The rest of the flat field is lit.
+        assert!(!shadow[idx(0, 0)]);
+        assert!(!shadow[idx(7, 7)]);
+    }
+
+    #[test]
+    fn shade_darkens_and_keeps_void_black() {
+        assert_eq!(shade([100, 200, 50]), [55, 110, 27]);
+        assert_eq!(shade(NO_BLOCK), NO_BLOCK);
+
+        let c = [255u8, 200, 100];
+        let s = shade(c);
+        assert!(s[0] <= c[0] && s[1] <= c[1] && s[2] <= c[2]);
+    }
+
+    #[test]
+    fn shaded_map_renders_darkened_shadow_cells() {
+        let grid_w = 16;
+        let grid_h = 16;
+        // A single chunk of flat sand field at height 0 with one pillar of
+        // height 3 at (x=4, z=1).
+        let mut heights = vec![0i32; grid_w * grid_h];
+        heights[1 * grid_w + 4] = 3;
+        let colors: Vec<[u8; 3]> =
+            vec![block_color("minecraft:sand"); grid_w * grid_h];
+        let shadow = compute_shadows(&heights, grid_w, grid_h);
+
+        let mut img = RgbImage::new(16, 16);
+        render_shaded_map(&mut img, &colors, &shadow, grid_w, 0, 0, 0, 0, 1);
+
+        let lit = block_color("minecraft:sand");
+        let dark = shade(lit);
+
+        // The three diagonal cells toward the bottom-left are shadowed.
+        assert_eq!(img.get_pixel(3, 2).0, dark);
+        assert_eq!(img.get_pixel(2, 3).0, dark);
+        assert_eq!(img.get_pixel(1, 4).0, dark);
+        // The pillar top and the cell just past the shadow stay at the lit
+        // color, as does the rest of the flat field.
+        assert_eq!(img.get_pixel(4, 1).0, lit);
+        assert_eq!(img.get_pixel(0, 5).0, lit);
+        assert_eq!(img.get_pixel(0, 0).0, lit);
     }
 }
 
