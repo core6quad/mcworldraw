@@ -86,6 +86,7 @@ struct Args {
     world_path: String,
     single: bool,
     scale: u32,
+    dim: i32,
 }
 
 fn print_usage() {
@@ -97,6 +98,8 @@ fn print_usage() {
          -z, --scale <N>      Downsample so each pixel is N x N blocks; the\n\
                               pixel color is the most common block in the area\n\
                               (1 = one pixel per block, the default)\n\
+         -d, --dim <N>        Dimension id to render: 0 = overworld (default),\n\
+                              1 = the nether, -1 = the end\n\
          -h, --help           Show this message"
     );
 }
@@ -105,6 +108,7 @@ fn parse_args() -> Result<Args, String> {
     let mut world_path: Option<String> = None;
     let mut single = false;
     let mut scale: u32 = 1;
+    let mut dim: i32 = 0;
 
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -128,6 +132,16 @@ fn parse_args() -> Result<Args, String> {
             _ if arg.starts_with("--scale=") => {
                 scale = parse_scale(&arg["--scale=".len()..])?;
             }
+            "--dim" | "-d" => {
+                i += 1;
+                let value = raw
+                    .get(i)
+                    .ok_or("--dim requires a value (e.g. --dim 1)")?;
+                dim = parse_dim(value)?;
+            }
+            _ if arg.starts_with("--dim=") => {
+                dim = parse_dim(&arg["--dim=".len()..])?;
+            }
             other => {
                 if world_path.is_some() {
                     return Err(format!("Unexpected argument: {other}"));
@@ -142,7 +156,7 @@ fn parse_args() -> Result<Args, String> {
     let world_path =
         world_path.ok_or_else(|| "Missing <path-to-world> argument".to_string())?;
 
-    Ok(Args { world_path, single, scale })
+    Ok(Args { world_path, single, scale, dim })
 }
 
 /// Parse and validate a `--scale` value: a positive integer (>= 1).
@@ -160,6 +174,214 @@ fn parse_scale(value: &str) -> Result<u32, String> {
     Ok(scale)
 }
 
+/// Parse and validate a `--dim` value: it must be a (signed) integer.
+///
+/// Whether the integer names a supported dimension is checked separately by
+/// [`dimension_info`], which also reports the set of valid ids.
+fn parse_dim(value: &str) -> Result<i32, String> {
+    value
+        .parse::<i32>()
+        .map_err(|_| format!("Invalid dimension id: {value:?}"))
+}
+
+/// Which non-overworld dimension a chunk's blocks tell us it belongs to.
+///
+/// Only used to disambiguate the legacy `DIM1` / `DIM-1` folders, whose names
+/// do not reliably indicate which dimension they actually hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DimKind {
+    Nether,
+    End,
+}
+
+/// A supported dimension and where its region files live on disk.
+#[derive(Clone, Copy, Debug)]
+struct DimensionInfo {
+    /// Human-readable name, e.g. "overworld".
+    name: &'static str,
+    /// What non-overworld dimension this is, used to match legacy region
+    /// folders by their actual block content. `None` for the overworld.
+    kind: Option<DimKind>,
+    /// Candidate region folders (relative to the world folder), in order of
+    /// preference.
+    ///
+    /// The modern `dimensions/minecraft:<name>/region` folders are named after
+    /// the dimension, so an existing one is unambiguously the right one. The
+    /// legacy `DIM1/region` and `DIM-1/region` folders are listed for both
+    /// dimensions and disambiguated by content (see [`dimension_region_path`]).
+    region_candidates: &'static [&'static str],
+    /// Prefix applied to per-chunk output file names so that different
+    /// dimensions do not overwrite one another. Empty for the default
+    /// overworld, whose output names are left unchanged.
+    out_prefix: &'static str,
+    /// File name of the single-image output in `--single` mode.
+    out_file: &'static str,
+}
+
+/// Map a dimension id to its on-disk region folder and output naming.
+///
+/// Dimension ids follow Minecraft's classic convention:
+///
+/// * `0`  -> overworld (`region/`)
+/// * `1`  -> the nether
+/// * `-1` -> the end
+///
+/// Any other id is rejected with a message listing the valid values.
+fn dimension_info(id: i32) -> Result<DimensionInfo, String> {
+    match id {
+        0 => Ok(DimensionInfo {
+            name: "overworld",
+            kind: None,
+            region_candidates: &["region"],
+            out_prefix: "",
+            out_file: "world.png",
+        }),
+        1 => Ok(DimensionInfo {
+            name: "the_nether",
+            kind: Some(DimKind::Nether),
+            region_candidates: &[
+                "dimensions/minecraft:the_nether/region",
+                "DIM1/region",
+                "DIM-1/region",
+            ],
+            out_prefix: "the_nether_",
+            out_file: "the_nether.png",
+        }),
+        -1 => Ok(DimensionInfo {
+            name: "the_end",
+            kind: Some(DimKind::End),
+            region_candidates: &[
+                "dimensions/minecraft:the_end/region",
+                "DIM1/region",
+                "DIM-1/region",
+            ],
+            out_prefix: "the_end_",
+            out_file: "the_end.png",
+        }),
+        other => Err(format!(
+            "Unknown dimension id {other}. Valid ids: 0 (overworld), 1 (the nether), -1 (the end)."
+        )),
+    }
+}
+
+/// Block ids that are a reliable signature of each non-overworld dimension.
+const NETHER_BLOCKS: &[&str] = &[
+    "minecraft:netherrack",
+    "minecraft:nether_wart_block",
+    "minecraft:nether_bricks",
+    "minecraft:soul_sand",
+    "minecraft:soul_soil",
+    "minecraft:crimson_roots",
+    "minecraft:warped_roots",
+    "minecraft:crimson_stem",
+    "minecraft:warped_stem",
+    "minecraft:magma_block",
+    "minecraft:crimson_fungus",
+    "minecraft:warped_fungus",
+    "minecraft:weeping_vines",
+    "minecraft:twisting_vines",
+    "minecraft:shroomlight",
+    "minecraft:red_mushroom",
+    "minecraft:brown_mushroom",
+];
+const END_BLOCKS: &[&str] = &[
+    "minecraft:end_stone",
+    "minecraft:ender_chest",
+    "minecraft:end_rod",
+];
+
+/// Classify a region folder by the dimension its chunks actually contain.
+///
+/// Samples the top-most block of as many chunk columns as needed until a clear
+/// run of dimension signature blocks shows up. Returns `None` when the folder
+/// holds no recognizable signature (e.g. it is empty).
+fn classify_region_dir(region_dir: &Path) -> Option<DimKind> {
+    let mut nether = 0u32;
+    let mut end = 0u32;
+    let mut files: Vec<PathBuf> = fs::read_dir(region_dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "mca"))
+        .collect();
+    files.sort();
+
+    for path in &files {
+        let Ok(data) = fs::read(path) else { continue };
+        let Ok(mut region) = RegionReader::new(&data) else { continue };
+        'chunks: for local_z in 0..32u8 {
+            for local_x in 0..32u8 {
+                let Ok(Some(chunk_data)) = region.chunk(local_x, local_z) else {
+                    continue;
+                };
+                let Ok(chunk) = from_bytes::<Chunk>(&chunk_data) else {
+                    continue;
+                };
+                for block in get_top_blocks(&chunk).blocks.iter().flatten() {
+                    if NETHER_BLOCKS.contains(&block.as_str()) {
+                        nether += 1;
+                    } else if END_BLOCKS.contains(&block.as_str()) {
+                        end += 1;
+                    }
+                }
+                if nether.saturating_add(end) >= 16 {
+                    break 'chunks;
+                }
+            }
+        }
+    }
+
+    if nether == 0 && end == 0 {
+        None
+    } else if nether > end {
+        Some(DimKind::Nether)
+    } else {
+        Some(DimKind::End)
+    }
+}
+
+/// Locate a dimension's on-disk region folder.
+///
+/// Modern `dimensions/minecraft:<name>/region` folders are named after the
+/// dimension, so the first one that exists is used as-is. The legacy
+/// `DIM1/region` and `DIM-1/region` folders are ambiguous (different worlds
+/// store the nether and the end in different one of them), so each existing
+/// legacy folder is inspected by its block content and only the one matching
+/// [`DimensionInfo::kind`] is used. Returns `None` if no matching folder is
+/// found.
+fn dimension_region_path(world_path: &Path, dim: &DimensionInfo) -> Option<PathBuf> {
+    // 1) The overworld never needs disambiguation.
+    let Some(kind) = dim.kind else {
+        return dim
+            .region_candidates
+            .iter()
+            .map(|cand| world_path.join(*cand))
+            .find(|p| p.is_dir());
+    };
+
+    // 2) Modern, dimension-named folders are unambiguous.
+    for cand in dim.region_candidates {
+        if cand.starts_with("dimensions/minecraft:") {
+            let path = world_path.join(*cand);
+            if path.is_dir() {
+                return Some(path);
+            }
+        }
+    }
+
+    // 3) Legacy folders: pick the one whose content matches this dimension.
+    for cand in dim.region_candidates {
+        if cand.starts_with("dimensions/minecraft:") {
+            continue;
+        }
+        let path = world_path.join(*cand);
+        if path.is_dir() && classify_region_dir(&path) == Some(kind) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = match parse_args() {
         Ok(args) => args,
@@ -170,15 +392,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let region_path = Path::new(&args.world_path).join("region");
+    let dim = match dimension_info(args.dim) {
+        Ok(dim) => dim,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            std::process::exit(1);
+        }
+    };
 
-    if !region_path.is_dir() {
-        return Err(format!(
-            "Region directory does not exist: {}",
-            region_path.display()
-        )
-        .into());
-    }
+    let region_path = match dimension_region_path(Path::new(&args.world_path), &dim) {
+        Some(path) => path,
+        None => {
+            let tried = dim
+                .region_candidates
+                .iter()
+                .map(|cand| {
+                    Path::new(&args.world_path)
+                        .join(*cand)
+                        .display()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "Region directory does not exist for {}. Looked for: {tried}",
+                dim.name
+            )
+            .into());
+        }
+    };
 
     let mut region_files = Vec::<PathBuf>::new();
 
@@ -240,9 +483,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (width, height) = (width as u32, height as u32);
 
         println!(
-            "Found {} region files and {} chunks. Rendering a single {}x{} PNG (scale {}) to {}",
+            "Found {} region files and {} chunks in {} ({}). Rendering a single {}x{} PNG (scale {}) to {}",
             region_files.len(),
             total_chunks,
+            region_path.display(),
+            dim.name,
             width,
             height,
             args.scale,
@@ -264,7 +509,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         pb.finish_with_message("Done");
 
-        let out_path = out_dir.join("world.png");
+        let out_path = out_dir.join(dim.out_file);
         img.save(&out_path)?;
 
         println!();
@@ -274,14 +519,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "Found {} region files and {} chunks. Writing PNGs to {}",
+        "Found {} region files and {} chunks in {} ({}). Writing PNGs to {}",
         region_files.len(),
         total_chunks,
+        region_path.display(),
+        dim.name,
         out_dir.display()
     );
 
     for path in &region_files {
-        process_region(path, out_dir, args.scale, &pb)?;
+        process_region(path, out_dir, args.scale, dim.out_prefix, &pb)?;
     }
 
     pb.finish_with_message("Done");
@@ -297,6 +544,7 @@ fn process_region(
     path: &Path,
     out_dir: &Path,
     scale: u32,
+    dim_prefix: &str,
     pb: &ProgressBar,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let Some((region_x, region_z)) = parse_region_coords(path) else {
@@ -333,7 +581,8 @@ fn process_region(
 
             let top = get_top_blocks(&chunk);
 
-            let out_path = out_dir.join(format!("c_{chunk_x}_{chunk_z}.png"));
+            let out_path =
+                out_dir.join(format!("{dim_prefix}c_{chunk_x}_{chunk_z}.png"));
             render_chunk_png(&top, &out_path, scale)?;
 
             generated += 1;
@@ -1060,6 +1309,57 @@ mod tests {
         assert_eq!(merged.min_z, -10);
         assert_eq!(merged.max_x, 5);
         assert_eq!(merged.max_z, 100);
+    }
+
+    #[test]
+    fn dimension_info_maps_known_ids() {
+        let overworld = dimension_info(0).expect("overworld should be valid");
+        assert_eq!(overworld.name, "overworld");
+        assert_eq!(overworld.kind, None);
+        assert_eq!(overworld.region_candidates, ["region"]);
+        assert_eq!(overworld.out_prefix, "");
+        assert_eq!(overworld.out_file, "world.png");
+
+        let nether = dimension_info(1).expect("nether should be valid");
+        assert_eq!(nether.name, "the_nether");
+        assert_eq!(nether.kind, Some(DimKind::Nether));
+        // The modern layout is named after the dimension and is unambiguous.
+        assert!(nether
+            .region_candidates
+            .contains(&"dimensions/minecraft:the_nether/region"));
+        // The legacy layout is shared and disambiguated by content, so both
+        // folder names are offered as candidates.
+        assert!(nether.region_candidates.contains(&"DIM1/region"));
+        assert!(nether.region_candidates.contains(&"DIM-1/region"));
+        assert_eq!(nether.out_prefix, "the_nether_");
+        assert_eq!(nether.out_file, "the_nether.png");
+
+        let end = dimension_info(-1).expect("the end should be valid");
+        assert_eq!(end.name, "the_end");
+        assert_eq!(end.kind, Some(DimKind::End));
+        assert!(end
+            .region_candidates
+            .contains(&"dimensions/minecraft:the_end/region"));
+        assert!(end.region_candidates.contains(&"DIM1/region"));
+        assert!(end.region_candidates.contains(&"DIM-1/region"));
+        assert_eq!(end.out_prefix, "the_end_");
+        assert_eq!(end.out_file, "the_end.png");
+    }
+
+    #[test]
+    fn dimension_info_rejects_unknown_ids() {
+        assert!(dimension_info(2).is_err());
+        assert!(dimension_info(-2).is_err());
+        assert!(dimension_info(99).is_err());
+    }
+
+    #[test]
+    fn parse_dim_validates_input() {
+        assert_eq!(parse_dim("0"), Ok(0));
+        assert_eq!(parse_dim("1"), Ok(1));
+        assert_eq!(parse_dim("-1"), Ok(-1));
+        assert!(parse_dim("abc").is_err());
+        assert!(parse_dim("1.5").is_err());
     }
 }
 
