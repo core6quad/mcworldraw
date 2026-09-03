@@ -59,12 +59,80 @@ struct ChunkTop {
     heights: [Option<i32>; COLUMNS],
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let world_path = env::args()
-        .nth(1)
-        .expect("Usage: mcmap <path-to-world>");
+/// Bounding box of chunk coordinates, in chunk units (not blocks).
+#[derive(Clone, Copy, Debug)]
+struct Bounds {
+    min_x: i32,
+    min_z: i32,
+    max_x: i32,
+    max_z: i32,
+}
 
-    let region_path = Path::new(&world_path).join("region");
+impl Bounds {
+    /// The bounding box that encloses both `self` and `other`.
+    fn merged(&self, other: &Self) -> Self {
+        Bounds {
+            min_x: self.min_x.min(other.min_x),
+            min_z: self.min_z.min(other.min_z),
+            max_x: self.max_x.max(other.max_x),
+            max_z: self.max_z.max(other.max_z),
+        }
+    }
+}
+
+/// Parsed command-line arguments.
+struct Args {
+    world_path: String,
+    single: bool,
+}
+
+fn print_usage() {
+    println!(
+        "Usage: mcmap <path-to-world> [options]\n\n\
+         Renders a top-down map of a Minecraft world from its region files.\n\n\
+         Options:\n\
+         -s, --single    Render one big PNG instead of one PNG per chunk\n\
+         -h, --help      Show this message"
+    );
+}
+
+fn parse_args() -> Result<Args, String> {
+    let mut world_path: Option<String> = None;
+    let mut single = false;
+
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            "--single" | "--big" | "-s" => single = true,
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            other => {
+                if world_path.is_some() {
+                    return Err(format!("Unexpected argument: {other}"));
+                }
+                world_path = Some(other.to_string());
+            }
+        }
+    }
+
+    let world_path =
+        world_path.ok_or_else(|| "Missing <path-to-world> argument".to_string())?;
+
+    Ok(Args { world_path, single })
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = match parse_args() {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            std::process::exit(1);
+        }
+    };
+
+    let region_path = Path::new(&args.world_path).join("region");
 
     if !region_path.is_dir() {
         return Err(format!(
@@ -90,18 +158,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(out_dir)?;
 
     // First pass: count the chunks that actually exist so we can build a
-    // determinate progress bar before decoding anything.
-    let total_chunks = region_files
-        .iter()
-        .map(|p| count_region_chunks(p))
-        .sum::<usize>();
+    // determinate progress bar, and track the world's bounding box so we can
+    // size the single output image in --single mode.
+    let mut total_chunks = 0usize;
+    let mut world_bounds: Option<Bounds> = None;
 
-    println!(
-        "Found {} region files and {} chunks. Writing PNGs to {}",
-        region_files.len(),
-        total_chunks,
-        out_dir.display()
-    );
+    for path in &region_files {
+        let (count, bounds) = scan_region(path);
+        total_chunks += count;
+
+        if let Some(b) = bounds {
+            world_bounds = Some(match world_bounds {
+                Some(prev) => prev.merged(&b),
+                None => b,
+            });
+        }
+    }
+
+    if total_chunks == 0 {
+        println!("No chunks found in {}", region_path.display());
+        return Ok(());
+    }
 
     let pb = ProgressBar::new(total_chunks as u64);
     pb.set_style(
@@ -109,6 +186,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}",
         )
         .expect("valid progress bar template"),
+    );
+
+    if args.single {
+        let bounds = world_bounds.expect("bounds must exist when chunks exist");
+
+        let width = (bounds.max_x - bounds.min_x + 1) * CHUNK_SIZE as i32;
+        let height = (bounds.max_z - bounds.min_z + 1) * CHUNK_SIZE as i32;
+        let (width, height) = (width as u32, height as u32);
+
+        println!(
+            "Found {} region files and {} chunks. Rendering a single {}x{} PNG to {}",
+            region_files.len(),
+            total_chunks,
+            width,
+            height,
+            out_dir.display()
+        );
+
+        let mut img = RgbImage::new(width, height);
+
+        for path in &region_files {
+            process_region_single(path, &mut img, bounds.min_x, bounds.min_z, &pb)?;
+        }
+
+        pb.finish_with_message("Done");
+
+        let out_path = out_dir.join("world.png");
+        img.save(&out_path)?;
+
+        println!();
+        println!("Generated chunks: {total_chunks}");
+        println!("Output: {}", out_path.display());
+        return Ok(());
+    }
+
+    println!(
+        "Found {} region files and {} chunks. Writing PNGs to {}",
+        region_files.len(),
+        total_chunks,
+        out_dir.display()
     );
 
     for path in &region_files {
@@ -174,35 +291,63 @@ fn process_region(
     Ok(generated)
 }
 
-/// Best-effort count of the chunks that exist inside a region file.
+/// Best-effort scan of a region file.
 ///
-/// Used to compute the total for the progress bar. Errors are swallowed so a
-/// single bad file does not abort the counting pass (the processing pass will
-/// skip the same file).
-fn count_region_chunks(path: &Path) -> usize {
-    let Some(_coords) = parse_region_coords(path) else {
-        return 0;
+/// Counts the chunks that actually exist and tracks the min/max chunk
+/// coordinates across them. The count drives the determinate progress bar, and
+/// the bounding box is used to size the single output image in `--single` mode.
+/// Errors are swallowed so a single bad file does not abort the scan pass (the
+/// processing pass will skip the same file).
+///
+/// Returns `(chunk_count, bounds)`; `bounds` is `None` when the region holds
+/// no chunks.
+fn scan_region(path: &Path) -> (usize, Option<Bounds>) {
+    let Some((region_x, region_z)) = parse_region_coords(path) else {
+        return (0, None);
     };
 
     let Ok(data) = fs::read(path) else {
-        return 0;
+        return (0, None);
     };
 
     let Ok(mut region) = RegionReader::new(&data) else {
-        return 0;
+        return (0, None);
     };
 
     let mut count = 0usize;
+    let mut min_x = i32::MAX;
+    let mut min_z = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_z = i32::MIN;
 
     for local_z in 0..32u8 {
         for local_x in 0..32u8 {
             if let Ok(Some(_)) = region.chunk(local_x, local_z) {
                 count += 1;
+
+                let chunk_x = region_x * 32 + local_x as i32;
+                let chunk_z = region_z * 32 + local_z as i32;
+
+                min_x = min_x.min(chunk_x);
+                max_x = max_x.max(chunk_x);
+                min_z = min_z.min(chunk_z);
+                max_z = max_z.max(chunk_z);
             }
         }
     }
 
-    count
+    let bounds = if count > 0 {
+        Some(Bounds {
+            min_x,
+            min_z,
+            max_x,
+            max_z,
+        })
+    } else {
+        None
+    };
+
+    (count, bounds)
 }
 
 /// Parse the `r.X.Z.mca` filename into (region_x, region_z).
@@ -244,6 +389,85 @@ fn render_chunk_png(
     }
 
     img.save(out_path)?;
+
+    Ok(())
+}
+
+/// Blit a chunk into an already-sized shared image at a given pixel offset.
+///
+/// `offset_x` / `offset_z` are the pixel coordinates of the chunk's top-left
+/// corner inside the big image (1 pixel = 1 block).
+fn render_into_big(
+    img: &mut RgbImage,
+    top: &ChunkTop,
+    offset_x: u32,
+    offset_z: u32,
+) {
+    for z in 0..CHUNK_SIZE {
+        for x in 0..CHUNK_SIZE {
+            let i = z * CHUNK_SIZE + x;
+
+            let rgb = match &top.blocks[i] {
+                Some(name) => block_color(name),
+                None => NO_BLOCK,
+            };
+
+            img.put_pixel(offset_x + x as u32, offset_z + z as u32, Rgb(rgb));
+        }
+    }
+}
+
+/// Decode a region and composite each of its chunks into a shared big image.
+///
+/// `min_chunk_x` / `min_chunk_z` are the world's minimum chunk coordinates,
+/// used to translate each chunk's absolute position into image pixel offsets.
+fn process_region_single(
+    path: &Path,
+    img: &mut RgbImage,
+    min_chunk_x: i32,
+    min_chunk_z: i32,
+    pb: &ProgressBar,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some((region_x, region_z)) = parse_region_coords(path) else {
+        eprintln!("Skipping invalid region filename: {}", path.display());
+        return Ok(());
+    };
+
+    let data = fs::read(path)?;
+
+    // Empty (0-byte) region files show up frequently as placeholders, and
+    // some may be malformed. Skip them instead of aborting the whole run.
+    let mut region = match RegionReader::new(&data) {
+        Ok(region) => region,
+        Err(e) => {
+            eprintln!("Skipping region {}: {e}", path.display());
+            return Ok(());
+        }
+    };
+
+    pb.set_message(format!("r.{region_x}.{region_z}"));
+
+    for local_z in 0..32u8 {
+        for local_x in 0..32u8 {
+            let Some(chunk_data) = region.chunk(local_x, local_z)? else {
+                continue;
+            };
+
+            let chunk_x = region_x * 32 + local_x as i32;
+            let chunk_z = region_z * 32 + local_z as i32;
+
+            let chunk: Chunk = from_bytes(chunk_data)?;
+
+            let top = get_top_blocks(&chunk);
+
+            let offset_x = (chunk_x - min_chunk_x) * CHUNK_SIZE as i32;
+            let offset_z = (chunk_z - min_chunk_z) * CHUNK_SIZE as i32;
+
+            render_into_big(img, &top, offset_x as u32, offset_z as u32);
+
+            pb.inc(1);
+        }
+    }
 
     Ok(())
 }
@@ -591,6 +815,59 @@ mod tests {
         assert_eq!(img.get_pixel(15, 15).0, [0, 0, 0, 255]);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn composites_chunks_into_a_single_image() {
+        // Chunk A occupies pixel columns 0..16 and only column (x=0, z=0) is
+        // grass. Chunk B occupies pixel columns 16..32 and is all sand.
+        let top_a = ChunkTop {
+            blocks: std::array::from_fn(|i| {
+                (i == 0).then(|| "minecraft:grass_block".to_string())
+            }),
+            heights: [None; COLUMNS],
+        };
+        let top_b = ChunkTop {
+            blocks: std::array::from_fn(|_| Some("minecraft:sand".to_string())),
+            heights: [None; COLUMNS],
+        };
+
+        let mut img = RgbImage::new(32, 16);
+        render_into_big(&mut img, &top_a, 0, 0);
+        render_into_big(&mut img, &top_b, 16, 0);
+
+        assert_eq!(img.dimensions(), (32, 16));
+
+        // Chunk A: top-left pixel is the grass column.
+        assert_eq!(img.get_pixel(0, 0).0, [106, 170, 64]);
+        // The rest of chunk A is void (black).
+        assert_eq!(img.get_pixel(1, 0).0, [0, 0, 0]);
+        assert_eq!(img.get_pixel(15, 15).0, [0, 0, 0]);
+
+        // Chunk B starts at x=16 and is entirely sand.
+        assert_eq!(img.get_pixel(16, 0).0, [219, 209, 160]);
+        assert_eq!(img.get_pixel(31, 15).0, [219, 209, 160]);
+    }
+
+    #[test]
+    fn bounds_merge_covers_both_boxes() {
+        let a = Bounds {
+            min_x: -5,
+            min_z: -10,
+            max_x: 5,
+            max_z: 10,
+        };
+        let b = Bounds {
+            min_x: 0,
+            min_z: -1,
+            max_x: 3,
+            max_z: 100,
+        };
+        let merged = a.merged(&b);
+        assert_eq!(merged.min_x, -5);
+        assert_eq!(merged.min_z, -10);
+        assert_eq!(merged.max_x, 5);
+        assert_eq!(merged.max_z, 100);
     }
 }
 
