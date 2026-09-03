@@ -27,6 +27,11 @@ const VOID_H: i32 = -1_000_000;
 const SHADOW_NUMERATOR: u32 = 55;
 const SHADOW_DENOMINATOR: u32 = 100;
 
+/// Supersampling factor for `--supersample`: each block is drawn as a solid
+/// `SUPER_SAMPLE x SUPER_SAMPLE` pixel square (5 pixels per block) with no
+/// interpolation between blocks.
+const SUPER_SAMPLE: u32 = 5;
+
 #[derive(Debug, Deserialize)]
 struct Chunk {
     #[serde(default)]
@@ -99,6 +104,7 @@ struct Args {
     scale: u32,
     dim: i32,
     shadows: bool,
+    supersample: bool,
 }
 
 fn print_usage() {
@@ -115,6 +121,11 @@ fn print_usage() {
          -r, --shadows        Render diagonal elevation shadows as if the sun\n\
                               were 45 degrees up at the top-right (only applies\n\
                               in single mode, i.e. together with -s)\n\
+         -ss, --supersample   Render each block as a solid 5x5 pixel square\n\
+                              (5 pixels per block, no interpolation). When\n\
+                              shadows are enabled they are resolved at pixel\n\
+                              resolution so their edges stay smooth. Cannot be\n\
+                              combined with -z/--scale\n\
          -h, --help           Show this message"
     );
 }
@@ -123,8 +134,10 @@ fn parse_args() -> Result<Args, String> {
     let mut world_path: Option<String> = None;
     let mut single = false;
     let mut scale: u32 = 1;
+    let mut scale_set = false;
     let mut dim: i32 = 0;
     let mut shadows = false;
+    let mut supersample = false;
 
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -135,6 +148,7 @@ fn parse_args() -> Result<Args, String> {
         match arg {
             "--single" | "--big" | "-s" => single = true,
             "--shadows" | "--shadow" | "-r" => shadows = true,
+            "--supersample" | "-ss" => supersample = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -145,9 +159,11 @@ fn parse_args() -> Result<Args, String> {
                     .get(i)
                     .ok_or("--scale requires a value (e.g. --scale 2)")?;
                 scale = parse_scale(value)?;
+                scale_set = true;
             }
             _ if arg.starts_with("--scale=") => {
                 scale = parse_scale(&arg["--scale=".len()..])?;
+                scale_set = true;
             }
             "--dim" | "-d" => {
                 i += 1;
@@ -170,10 +186,16 @@ fn parse_args() -> Result<Args, String> {
         i += 1;
     }
 
+    if supersample && scale_set {
+        return Err(
+            "--supersample (-ss) cannot be combined with --scale (-z/--scale)".into(),
+        );
+    }
+
     let world_path =
         world_path.ok_or_else(|| "Missing <path-to-world> argument".to_string())?;
 
-    Ok(Args { world_path, single, scale, dim, shadows })
+    Ok(Args { world_path, single, scale, dim, shadows, supersample })
 }
 
 /// Parse and validate a `--scale` value: a positive integer (>= 1).
@@ -490,32 +512,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bounds = world_bounds.expect("bounds must exist when chunks exist");
 
         let scale = args.scale as i32;
+        let ss = if args.supersample { SUPER_SAMPLE as i32 } else { 1 };
         let blocks_w = (bounds.max_x - bounds.min_x + 1) * (CHUNK_SIZE as i32);
         let blocks_h = (bounds.max_z - bounds.min_z + 1) * (CHUNK_SIZE as i32);
 
-        // Each output pixel covers `scale x scale` blocks, so the image is
-        // smaller by that factor (rounded up to a whole pixel).
-        let width = (blocks_w + scale - 1) / scale;
-        let height = (blocks_h + scale - 1) / scale;
+        // In supersample mode each block becomes a solid `ss x ss` pixel square
+        // (upsampling), so the image is larger by that factor. Otherwise each
+        // output pixel covers `scale x scale` blocks (downsampling), so the
+        // image is smaller by that factor (rounded up to a whole pixel).
+        let width = if args.supersample {
+            blocks_w * ss
+        } else {
+            (blocks_w + scale - 1) / scale
+        };
+        let height = if args.supersample {
+            blocks_h * ss
+        } else {
+            (blocks_h + scale - 1) / scale
+        };
         let (width, height) = (width as u32, height as u32);
 
+        let res_desc = if args.supersample {
+            format!("supersampled {} px/block", SUPER_SAMPLE)
+        } else {
+            format!("scale {}", args.scale)
+        };
         let shadows_note = if args.shadows { " with shadows" } else { "" };
         println!(
-            "Found {} region files and {} chunks in {} ({}). Rendering a single {}x{} PNG (scale {}){shadows_note} to {}",
+            "Found {} region files and {} chunks in {} ({}). Rendering a single {}x{} PNG ({res_desc}){shadows_note} to {}",
             region_files.len(),
             total_chunks,
             region_path.display(),
             dim.name,
             width,
             height,
-            args.scale,
             out_dir.display()
         );
 
         let mut img = RgbImage::new(width, height);
 
         if args.shadows {
-            // Shadow rendering is done over the whole map at block resolution:
+            // Shadow rendering is done over the whole map:
             //
             //   1. One pass over the region files fills two global grids -- the
             //      surface height and the base top-down color of every block
@@ -525,6 +562,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             //      up-right of it, i.e. whether the column is in shadow.
             //   3. The image is filled in-memory from those grids, darkening
             //      shadowed columns. No second region read is needed.
+            //
+            // In supersample mode the shadow is resolved at pixel resolution
+            // (see `supersampled_heights`) so its diagonal edges stay smooth
+            // even though the block colors are drawn as solid squares.
             let grid_w = blocks_w as usize;
             let grid_h = blocks_h as usize;
             let n = grid_w * grid_h;
@@ -544,20 +585,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
 
-            let shadow = compute_shadows(&heights, grid_w, grid_h);
-            drop(heights);
+            if args.supersample {
+                let s = SUPER_SAMPLE as usize;
+                let pw = grid_w * s;
+                let ph = grid_h * s;
+                let pixel_heights = supersampled_heights(&heights, grid_w, grid_h, s);
+                let pixel_shadow = compute_shadows(&pixel_heights, pw, ph);
+                drop(pixel_heights);
+                drop(heights);
 
-            render_shaded_map(
-                &mut img,
-                &colors,
-                &shadow,
-                grid_w,
-                bounds.min_x,
-                bounds.min_z,
-                bounds.max_x,
-                bounds.max_z,
-                args.scale,
-            );
+                render_shaded_map_ss(&mut img, &colors, &pixel_shadow, grid_w, grid_h, s);
+            } else {
+                let shadow = compute_shadows(&heights, grid_w, grid_h);
+                drop(heights);
+
+                render_shaded_map(
+                    &mut img,
+                    &colors,
+                    &shadow,
+                    grid_w,
+                    bounds.min_x,
+                    bounds.min_z,
+                    bounds.max_x,
+                    bounds.max_z,
+                    args.scale,
+                );
+            }
+        } else if args.supersample {
+            let s = SUPER_SAMPLE as i32;
+            for path in &region_files {
+                process_region_single_ss(
+                    path,
+                    &mut img,
+                    bounds.min_x,
+                    bounds.min_z,
+                    s,
+                    &pb,
+                )?;
+            }
         } else {
             for path in &region_files {
                 process_region_single(
@@ -596,7 +661,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     for path in &region_files {
-        process_region(path, out_dir, args.scale, dim.out_prefix, &pb)?;
+        process_region(path, out_dir, args.scale, args.supersample, dim.out_prefix, &pb)?;
     }
 
     pb.finish_with_message("Done");
@@ -612,6 +677,7 @@ fn process_region(
     path: &Path,
     out_dir: &Path,
     scale: u32,
+    supersample: bool,
     dim_prefix: &str,
     pb: &ProgressBar,
 ) -> Result<usize, Box<dyn std::error::Error>> {
@@ -651,7 +717,11 @@ fn process_region(
 
             let out_path =
                 out_dir.join(format!("{dim_prefix}c_{chunk_x}_{chunk_z}.png"));
-            render_chunk_png(&top, &out_path, scale)?;
+            if supersample {
+                render_chunk_png_ss(&top, &out_path, SUPER_SAMPLE)?;
+            } else {
+                render_chunk_png(&top, &out_path, scale)?;
+            }
 
             generated += 1;
             pb.inc(1);
@@ -826,6 +896,56 @@ fn blit_scaled(
     }
 }
 
+/// Write a top-down view where every block is a solid `s x s` pixel square,
+/// starting at pixel (`origin_x`, `origin_z`).
+///
+/// `blocks` is a row-major `region_w x region_h` grid of the highest non-air
+/// block per column (index = `z * region_w + x`), or `None` for void. Unlike
+/// [`blit_scaled`], this upsamples without any interpolation: every pixel of a
+/// block's `s x s` square gets the block's own color (void is [`NO_BLOCK`]).
+fn blit_supersampled(
+    out: &mut RgbImage,
+    blocks: &[Option<String>],
+    region_w: usize,
+    region_h: usize,
+    s: usize,
+    origin_x: u32,
+    origin_z: u32,
+) {
+    let s = s.max(1);
+    for z in 0..region_h {
+        for x in 0..region_w {
+            let rgb = match &blocks[z * region_w + x] {
+                Some(name) => block_color(name),
+                None => NO_BLOCK,
+            };
+            let base_x = origin_x + (x as u32) * (s as u32);
+            let base_z = origin_z + (z as u32) * (s as u32);
+            for dz in 0..s as u32 {
+                for dx in 0..s as u32 {
+                    out.put_pixel(base_x + dx, base_z + dz, Rgb(rgb));
+                }
+            }
+        }
+    }
+}
+
+/// Render the top-down view of a chunk as a supersampled PNG: each of the
+/// 16x16 blocks becomes a solid `scale x scale` pixel square, so the output is
+/// `16 * scale` on each side (no interpolation between blocks).
+fn render_chunk_png_ss(
+    top: &ChunkTop,
+    out_path: &Path,
+    scale: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let size = CHUNK_SIZE * scale as usize;
+    let mut img = RgbImage::new(size as u32, size as u32);
+    blit_supersampled(&mut img, &top.blocks, CHUNK_SIZE, CHUNK_SIZE, scale as usize, 0, 0);
+    img.save(out_path)?;
+
+    Ok(())
+}
+
 /// Color of the most common block within the block rectangle
 /// `[x0, x1) x [z0, z1)`.
 ///
@@ -926,6 +1046,41 @@ fn compute_shadows(heights: &[i32], grid_w: usize, grid_h: usize) -> Vec<bool> {
     }
 
     shadow
+}
+
+/// Upsample a block-resolution height grid to pixel resolution by nearest
+/// neighbor, so the shadow can be computed at pixel resolution in
+/// `--supersample` mode.
+///
+/// Real columns are multiplied by `s` while void columns keep the [`VOID_H`]
+/// sentinel. Multiplying the heights (rather than only the grid size) keeps the
+/// 45 degree sun's geometry intact when [`compute_shadows`] runs on the finer
+/// grid: a ray that descends one block per block still descends one block per
+/// `s` pixels, so shadow lengths are unchanged -- just resolved at pixel
+/// resolution, which makes the diagonal edges smooth.
+fn supersampled_heights(
+    heights: &[i32],
+    grid_w: usize,
+    grid_h: usize,
+    s: usize,
+) -> Vec<i32> {
+    let pw = grid_w * s;
+    let ph = grid_h * s;
+    let mut out = vec![VOID_H; pw * ph];
+
+    for z in 0..grid_h {
+        for x in 0..grid_w {
+            let bh = heights[z * grid_w + x];
+            let phv = if bh == VOID_H { VOID_H } else { bh * s as i32 };
+            for dz in 0..s {
+                for dx in 0..s {
+                    out[(z * s + dz) * pw + (x * s + dx)] = phv;
+                }
+            }
+        }
+    }
+
+    out
 }
 
 /// First shadow pass: read every region once and fill the global height and
@@ -1051,6 +1206,45 @@ fn render_shaded_map(
                 offset_x,
                 offset_z,
             );
+        }
+    }
+}
+
+/// Supersample shadow pass: fill `img` (sized `grid_w * s x grid_h * s`) from
+/// the block-resolution `colors` grid and a pixel-resolution `pixel_shadow`
+/// mask.
+///
+/// Every block is drawn as a solid `s x s` pixel square of its base color
+/// (no interpolation between blocks), but each of its pixels is darkened
+/// independently according to `pixel_shadow`. Because the shadow was computed
+/// at pixel resolution (see [`supersampled_heights`]), a block straddling the
+/// shadow edge gets a mix of lit and dark pixels, which renders the diagonal
+/// shadow boundary smoothly instead of as a coarse stairstep of blocks.
+fn render_shaded_map_ss(
+    img: &mut RgbImage,
+    colors: &[[u8; 3]],
+    pixel_shadow: &[bool],
+    grid_w: usize,
+    grid_h: usize,
+    s: usize,
+) {
+    let pw = grid_w * s;
+
+    for z in 0..grid_h {
+        for x in 0..grid_w {
+            let c = colors[z * grid_w + x];
+            let base_x = x * s;
+            let base_z = z * s;
+
+            for dz in 0..s {
+                for dx in 0..s {
+                    let px = base_x + dx;
+                    let pz = base_z + dz;
+                    let pi = pz * pw + px;
+                    let rgb = if pixel_shadow[pi] { shade(c) } else { c };
+                    img.put_pixel(px as u32, pz as u32, Rgb(rgb));
+                }
+            }
         }
     }
 }
@@ -1187,6 +1381,70 @@ fn process_region_single(
             let offset_z = ((chunk_z - min_chunk_z) * (CHUNK_SIZE as i32)) / s;
 
             render_into_big(img, &top, offset_x as u32, offset_z as u32, scale);
+
+            pb.inc(1);
+        }
+    }
+
+    Ok(())
+}
+
+/// Decode a region and composite each of its chunks into a shared big image in
+/// supersample mode: every block becomes a solid `ss x ss` pixel square, so a
+/// chunk sits at pixel offset `(chunk - min) * CHUNK_SIZE * ss` in the image.
+fn process_region_single_ss(
+    path: &Path,
+    img: &mut RgbImage,
+    min_chunk_x: i32,
+    min_chunk_z: i32,
+    ss: i32,
+    pb: &ProgressBar,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some((region_x, region_z)) = parse_region_coords(path) else {
+        eprintln!("Skipping invalid region filename: {}", path.display());
+        return Ok(());
+    };
+
+    let data = fs::read(path)?;
+
+    // Empty (0-byte) region files show up frequently as placeholders, and
+    // some may be malformed. Skip them instead of aborting the whole run.
+    let mut region = match RegionReader::new(&data) {
+        Ok(region) => region,
+        Err(e) => {
+            eprintln!("Skipping region {}: {e}", path.display());
+            return Ok(());
+        }
+    };
+
+    pb.set_message(format!("r.{region_x}.{region_z}"));
+
+    for local_z in 0..32u8 {
+        for local_x in 0..32u8 {
+            let Some(chunk_data) = region.chunk(local_x, local_z)? else {
+                continue;
+            };
+
+            let chunk_x = region_x * 32 + local_x as i32;
+            let chunk_z = region_z * 32 + local_z as i32;
+
+            let chunk: Chunk = from_bytes(chunk_data)?;
+            let top = get_top_blocks(&chunk);
+
+            let offset_x =
+                ((chunk_x - min_chunk_x) * (CHUNK_SIZE as i32) * ss) as u32;
+            let offset_z =
+                ((chunk_z - min_chunk_z) * (CHUNK_SIZE as i32) * ss) as u32;
+
+            blit_supersampled(
+                img,
+                &top.blocks,
+                CHUNK_SIZE,
+                CHUNK_SIZE,
+                ss as usize,
+                offset_x,
+                offset_z,
+            );
 
             pb.inc(1);
         }
@@ -1773,6 +2031,155 @@ mod tests {
         assert_eq!(img.get_pixel(4, 1).0, lit);
         assert_eq!(img.get_pixel(0, 5).0, lit);
         assert_eq!(img.get_pixel(0, 0).0, lit);
+    }
+
+    #[test]
+    fn supersample_renders_solid_5x5_blocks_without_interpolation() {
+        // Only block (x=0, z=0) is grass; everything else is void.
+        let top = ChunkTop {
+            blocks: std::array::from_fn(|i| {
+                (i == 0).then(|| "minecraft:grass_block".to_string())
+            }),
+            heights: [None; COLUMNS],
+        };
+
+        let path = std::env::temp_dir().join("worldraw_test_ss.png");
+        render_chunk_png_ss(&top, &path, SUPER_SAMPLE).expect("render should succeed");
+
+        let img = image::open(&path).expect("png should be readable");
+        assert_eq!(img.dimensions(), (16 * 5, 16 * 5));
+
+        // The grass block at (0,0) is a solid 5x5 grass square.
+        for z in 0..5u32 {
+            for x in 0..5u32 {
+                assert_eq!(img.get_pixel(x, z).0, [106, 170, 64, 255]);
+            }
+        }
+        // The neighbouring block (1,0) is void -> black.
+        assert_eq!(img.get_pixel(5, 0).0, [0, 0, 0, 255]);
+        assert_eq!(img.get_pixel(79, 79).0, [0, 0, 0, 255]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn supersampled_heights_scales_real_columns_and_keeps_void() {
+        // 2x2 block grid: three flat (height 0) and one pillar of height 3.
+        let mut heights = vec![0i32; 4];
+        heights[1] = 3;
+        let s = 5usize;
+
+        let out = supersampled_heights(&heights, 2, 2, s);
+        assert_eq!(out.len(), (2 * s) * (2 * s));
+
+        // Block (0,0) (height 0) -> its 5x5 pixels are all 0.
+        assert_eq!(out[(0 * s) * (2 * s) + 0 * s], 0);
+        // Block (1,0) (height 3) -> its 5x5 pixels are all 3 * s = 15.
+        assert_eq!(out[(0 * s) * (2 * s) + 1 * s], 15);
+
+        // A void column keeps the sentinel.
+        let void = vec![VOID_H, 0, 0, 0];
+        let void_out = supersampled_heights(&void, 2, 2, s);
+        assert_eq!(void_out[0], VOID_H);
+    }
+
+    #[test]
+    fn supersample_shadow_is_smooth_at_pixel_resolution() {
+        let grid_w = 8;
+        let grid_h = 8;
+        let s = 5usize;
+        // Flat field at height 0 with a single pillar of height 3 at (x=4, z=1).
+        let mut heights = vec![0i32; grid_w * grid_h];
+        heights[1 * grid_w + 4] = 3;
+
+        let pixel_heights = supersampled_heights(&heights, grid_w, grid_h, s);
+        let pw = grid_w * s;
+        let ph = grid_h * s;
+        let shadow = compute_shadows(&pixel_heights, pw, ph);
+
+        // A smooth, pixel-resolved shadow means some single block straddles the
+        // edge: within its 5x5 pixels there is a mix of lit and shadowed pixels
+        // (a block-resolved shadow would make each block uniformly lit or dark).
+        let mut found_partial = false;
+        for z in 0..grid_h {
+            for x in 0..grid_w {
+                let mut lit = 0;
+                let mut dark = 0;
+                for dz in 0..s {
+                    for dx in 0..s {
+                        let pi = (z * s + dz) * pw + (x * s + dx);
+                        if shadow[pi] {
+                            dark += 1;
+                        } else {
+                            lit += 1;
+                        }
+                    }
+                }
+                if lit > 0 && dark > 0 {
+                    found_partial = true;
+                }
+            }
+        }
+        assert!(
+            found_partial,
+            "a block should straddle the smooth shadow edge at pixel resolution"
+        );
+    }
+
+    #[test]
+    fn supersample_shaded_map_draws_solid_blocks_with_smooth_shadow() {
+        let grid_w = 8;
+        let grid_h = 8;
+        let s = 5usize;
+        let mut heights = vec![0i32; grid_w * grid_h];
+        heights[1 * grid_w + 4] = 3;
+        let colors: Vec<[u8; 3]> =
+            vec![block_color("minecraft:sand"); grid_w * grid_h];
+
+        let pixel_heights = supersampled_heights(&heights, grid_w, grid_h, s);
+        let pw = grid_w * s;
+        let ph = grid_h * s;
+        let pixel_shadow = compute_shadows(&pixel_heights, pw, ph);
+
+        let mut img = RgbImage::new((grid_w * s) as u32, (grid_h * s) as u32);
+        render_shaded_map_ss(&mut img, &colors, &pixel_shadow, grid_w, grid_h, s);
+
+        let lit = block_color("minecraft:sand");
+        let dark = shade(lit);
+
+        // Block (0,0) is far from any shadow: all its 5x5 pixels are lit.
+        for z in 0..s {
+            for x in 0..s {
+                assert_eq!(img.get_pixel(x as u32, z as u32).0, lit);
+            }
+        }
+
+        // Some block straddles the shadow edge, so within one block's 5x5
+        // pixels we see both lit and dark pixels (a smooth, interpolated shadow).
+        let mut found_partial = false;
+        for z in 0..grid_h {
+            for x in 0..grid_w {
+                let mut lit_cnt = 0;
+                let mut dark_cnt = 0;
+                for dz in 0..s {
+                    for dx in 0..s {
+                        let c = img.get_pixel((x * s + dx) as u32, (z * s + dz) as u32).0;
+                        if c == dark {
+                            dark_cnt += 1;
+                        } else if c == lit {
+                            lit_cnt += 1;
+                        }
+                    }
+                }
+                if lit_cnt > 0 && dark_cnt > 0 {
+                    found_partial = true;
+                }
+            }
+        }
+        assert!(
+            found_partial,
+            "a block should be partially shadowed along the smooth edge"
+        );
     }
 }
 
