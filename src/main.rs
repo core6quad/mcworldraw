@@ -3,11 +3,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fastnbt::{from_bytes, LongArray};
+use image::{Rgb, RgbImage};
+use indicatif::{ProgressBar, ProgressStyle};
 use mca::RegionReader;
 use serde::Deserialize;
 
 const CHUNK_SIZE: usize = 16;
 const COLUMNS: usize = 256;
+
+/// Color used for columns that have no non-air block (i.e. pure void).
+const NO_BLOCK: [u8; 3] = [0, 0, 0];
 
 #[derive(Debug, Deserialize)]
 struct Chunk {
@@ -47,6 +52,10 @@ struct ChunkTop {
     blocks: [Option<String>; COLUMNS],
 
     /// Absolute Minecraft Y coordinate.
+    ///
+    /// Retained for potential future elevation-based shading; not currently
+    /// used by the renderer.
+    #[allow(dead_code)]
     heights: [Option<i32>; COLUMNS],
 }
 
@@ -77,45 +86,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     region_files.sort();
 
-    println!("Found {} region files", region_files.len());
+    let out_dir = Path::new("output");
+    fs::create_dir_all(out_dir)?;
 
-    let mut total_chunks = 0usize;
+    // First pass: count the chunks that actually exist so we can build a
+    // determinate progress bar before decoding anything.
+    let total_chunks = region_files
+        .iter()
+        .map(|p| count_region_chunks(p))
+        .sum::<usize>();
 
-    for path in region_files {
-        total_chunks += process_region(&path)?;
+    println!(
+        "Found {} region files and {} chunks. Writing PNGs to {}",
+        region_files.len(),
+        total_chunks,
+        out_dir.display()
+    );
+
+    let pb = ProgressBar::new(total_chunks as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}",
+        )
+        .expect("valid progress bar template"),
+    );
+
+    for path in &region_files {
+        process_region(path, out_dir, &pb)?;
     }
 
+    pb.finish_with_message("Done");
+
     println!();
-    println!("Done.");
     println!("Generated chunks: {total_chunks}");
+    println!("Output directory: {}", out_dir.display());
 
     Ok(())
 }
 
-fn process_region(path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
-    let filename = path
-        .file_stem()
-        .ok_or("Invalid region filename")?
-        .to_string_lossy();
-
-    // Expected:
-    //
-    // r.X.Z.mca
-    //
-    let parts: Vec<&str> = filename.split('.').collect();
-
-    if parts.len() != 3 || parts[0] != "r" {
+fn process_region(
+    path: &Path,
+    out_dir: &Path,
+    pb: &ProgressBar,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let Some((region_x, region_z)) = parse_region_coords(path) else {
         eprintln!("Skipping invalid region filename: {}", path.display());
         return Ok(0);
-    }
-
-    let region_x: i32 = parts[1].parse()?;
-    let region_z: i32 = parts[2].parse()?;
-
-    println!(
-        "Region ({region_x}, {region_z}) - {}",
-        path.file_name().unwrap().to_string_lossy()
-    );
+    };
 
     let data = fs::read(path)?;
 
@@ -128,6 +145,8 @@ fn process_region(path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
             return Ok(0);
         }
     };
+
+    pb.set_message(format!("r.{region_x}.{region_z}"));
 
     let mut generated = 0usize;
 
@@ -144,33 +163,89 @@ fn process_region(path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
 
             let top = get_top_blocks(&chunk);
 
+            let out_path = out_dir.join(format!("c_{chunk_x}_{chunk_z}.png"));
+            render_chunk_png(&top, &out_path)?;
+
             generated += 1;
-
-            println!(
-                "  chunk ({chunk_x:>7}, {chunk_z:>7}) -> {} sections",
-                chunk.sections.len()
-            );
-
-            // Print the center column as a simple sanity check.
-            //
-            // x = 8
-            // z = 8
-            //
-            let i = 8 * 16 + 8;
-
-            match (&top.blocks[i], top.heights[i]) {
-                (Some(block), Some(y)) => {
-                    println!("      center: {block} at Y={y}");
-                }
-
-                _ => {
-                    println!("      center: no solid block");
-                }
-            }
+            pb.inc(1);
         }
     }
 
     Ok(generated)
+}
+
+/// Best-effort count of the chunks that exist inside a region file.
+///
+/// Used to compute the total for the progress bar. Errors are swallowed so a
+/// single bad file does not abort the counting pass (the processing pass will
+/// skip the same file).
+fn count_region_chunks(path: &Path) -> usize {
+    let Some(_coords) = parse_region_coords(path) else {
+        return 0;
+    };
+
+    let Ok(data) = fs::read(path) else {
+        return 0;
+    };
+
+    let Ok(mut region) = RegionReader::new(&data) else {
+        return 0;
+    };
+
+    let mut count = 0usize;
+
+    for local_z in 0..32u8 {
+        for local_x in 0..32u8 {
+            if let Ok(Some(_)) = region.chunk(local_x, local_z) {
+                count += 1;
+            }
+        }
+    }
+
+    count
+}
+
+/// Parse the `r.X.Z.mca` filename into (region_x, region_z).
+fn parse_region_coords(path: &Path) -> Option<(i32, i32)> {
+    let filename = path.file_stem()?.to_str()?;
+
+    let parts: Vec<&str> = filename.split('.').collect();
+
+    if parts.len() != 3 || parts[0] != "r" {
+        return None;
+    }
+
+    let x: i32 = parts[1].parse().ok()?;
+    let z: i32 = parts[2].parse().ok()?;
+
+    Some((x, z))
+}
+
+/// Render the top-down view of a chunk as a 16x16 PNG (1 pixel = 1 block).
+///
+/// Pixel (x, z) is colored by the highest non-air block in that column.
+fn render_chunk_png(
+    top: &ChunkTop,
+    out_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut img = RgbImage::new(CHUNK_SIZE as u32, CHUNK_SIZE as u32);
+
+    for z in 0..CHUNK_SIZE {
+        for x in 0..CHUNK_SIZE {
+            let i = z * CHUNK_SIZE + x;
+
+            let rgb = match &top.blocks[i] {
+                Some(name) => block_color(name),
+                None => NO_BLOCK,
+            };
+
+            img.put_pixel(x as u32, z as u32, Rgb(rgb));
+        }
+    }
+
+    img.save(out_path)?;
+
+    Ok(())
 }
 
 
@@ -323,5 +398,199 @@ fn is_air(name: &str) -> bool {
             | "minecraft:cave_air"
             | "minecraft:void_air"
     )
+}
+
+/// Map a Minecraft block name to a top-down view color.
+///
+/// Well-known surface blocks get hand-picked colors; anything else falls back
+/// to a stable color derived from a hash of the name so distinct unknown
+/// blocks are still visually distinguishable.
+fn block_color(name: &str) -> [u8; 3] {
+    match name {
+        // Grass & dirt.
+        "minecraft:grass_block" => [106, 170, 64],
+        "minecraft:dirt"
+        | "minecraft:dirt_with_roots"
+        | "minecraft:coarse_dirt" => [134, 96, 67],
+        "minecraft:rooted_dirt" => [124, 90, 60],
+        "minecraft:podzol" => [95, 70, 42],
+        "minecraft:mycelium" => [120, 104, 120],
+        "minecraft:moss_block" => [80, 130, 60],
+
+        // Stone family.
+        "minecraft:stone" | "minecraft:stone_bricks" => [125, 125, 125],
+        "minecraft:deepslate" | "minecraft:cobbled_deepslate" => [67, 67, 67],
+        "minecraft:granite" | "minecraft:polished_granite" => [138, 73, 56],
+        "minecraft:diorite" | "minecraft:polished_diorite" => [200, 200, 200],
+        "minecraft:andesite" | "minecraft:polished_andesite" => [136, 136, 136],
+        "minecraft:tuff" => [95, 95, 95],
+        "minecraft:calcite" => [233, 231, 226],
+        "minecraft:dripstone_block" => [170, 145, 120],
+        "minecraft:basalt" | "minecraft:polished_basalt" => [110, 108, 108],
+        "minecraft:bedrock" => [110, 110, 110],
+        "minecraft:obsidian" => [28, 24, 38],
+        "minecraft:crying_obsidian" => [30, 30, 60],
+        "minecraft:bricks" => [150, 96, 84],
+
+        // Nether.
+        "minecraft:netherrack" => [135, 58, 52],
+        "minecraft:nether_bricks" | "minecraft:red_nether_bricks" => [45, 30, 30],
+        "minecraft:nether_wart_block" => [96, 32, 110],
+        "minecraft:soul_sand" | "minecraft:soul_soil" => [120, 110, 105],
+        "minecraft:quartz_block" => [234, 228, 221],
+        "minecraft:blackstone" => [42, 42, 42],
+        "minecraft:magma_block" => [190, 60, 30],
+
+        // The End.
+        "minecraft:end_stone" | "minecraft:end_stone_bricks" => [221, 219, 165],
+        "minecraft:purpur_block" => [197, 168, 220],
+
+        // Sand & stone variants.
+        "minecraft:sand" => [219, 209, 160],
+        "minecraft:red_sand" => [190, 110, 70],
+        "minecraft:sandstone" => [217, 209, 158],
+        "minecraft:red_sandstone" => [189, 110, 60],
+
+        // Snow & ice.
+        "minecraft:snow" | "minecraft:snow_block" | "minecraft:powder_snow" => {
+            [247, 250, 253]
+        }
+        "minecraft:packed_ice" => [145, 190, 231],
+        "minecraft:ice" => [126, 175, 232],
+        "minecraft:blue_ice" => [98, 162, 232],
+
+        // Water & lava.
+        "minecraft:water" => [62, 121, 201],
+        "minecraft:lava" => [243, 118, 53],
+
+        // Wood: planks.
+        "minecraft:oak_planks" => [162, 130, 78],
+        "minecraft:spruce_planks" => [112, 84, 50],
+        "minecraft:birch_planks" => [192, 175, 121],
+        "minecraft:jungle_planks" => [160, 134, 68],
+        "minecraft:acacia_planks" => [168, 121, 53],
+        "minecraft:dark_oak_planks" => [66, 43, 20],
+        "minecraft:mangrove_planks" => [145, 104, 86],
+        "minecraft:cherry_planks" => [185, 143, 133],
+        "minecraft:pale_oak_planks" => [190, 178, 124],
+
+        // Wood: logs.
+        "minecraft:oak_log" => [104, 82, 50],
+        "minecraft:spruce_log" => [55, 40, 25],
+        "minecraft:birch_log" => [226, 224, 216],
+        "minecraft:jungle_log" => [134, 114, 62],
+        "minecraft:acacia_log" => [148, 103, 62],
+        "minecraft:dark_oak_log" => [46, 35, 16],
+        "minecraft:mangrove_log" => [120, 90, 70],
+        "minecraft:cherry_log" => [150, 105, 95],
+        "minecraft:pale_oak_log" => [180, 165, 120],
+
+        // Misc.
+        "minecraft:glass" => [190, 224, 235],
+        "minecraft:glowstone" => [250, 218, 138],
+        "minecraft:terracotta" => [152, 92, 69],
+        "minecraft:clay" => [160, 170, 190],
+        "minecraft:bone_block" => [230, 228, 210],
+        "minecraft:slime" => [96, 146, 60],
+
+        // Anything not listed above gets a stable hash-based color.
+        _ => hash_color(name),
+    }
+}
+
+/// Stable pseudo-random color derived from the block name (FNV-1a).
+///
+/// Keeps unknown blocks visually distinct from one another and stable across
+/// runs.
+fn hash_color(name: &str) -> [u8; 3] {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+
+    for b in name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    [
+        (30 + (h % 180)) as u8,
+        (30 + ((h >> 8) % 180)) as u8,
+        (30 + ((h >> 16) % 180)) as u8,
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::GenericImageView;
+
+    #[test]
+    fn parses_region_coords() {
+        assert_eq!(
+            parse_region_coords(Path::new("region/r.1.-2.mca")),
+            Some((1, -2))
+        );
+        assert_eq!(
+            parse_region_coords(Path::new("region/r.0.0.mca")),
+            Some((0, 0))
+        );
+        // Not an r.X.Z file.
+        assert_eq!(parse_region_coords(Path::new("region/foo.mca")), None);
+        // Too few components.
+        assert_eq!(parse_region_coords(Path::new("region/r.1.mca")), None);
+        // Non-numeric component.
+        assert_eq!(
+            parse_region_coords(Path::new("region/r.x.z.mca")),
+            None
+        );
+    }
+
+    #[test]
+    fn known_blocks_get_their_colors() {
+        assert_eq!(block_color("minecraft:grass_block"), [106, 170, 64]);
+        assert_eq!(block_color("minecraft:water"), [62, 121, 201]);
+        assert_eq!(block_color("minecraft:sand"), [219, 209, 160]);
+    }
+
+    #[test]
+    fn unknown_blocks_are_stable_and_bounded() {
+        let a = hash_color("minecraft:some_unknown_block");
+        let b = hash_color("minecraft:some_unknown_block");
+        assert_eq!(a, b, "hash color must be deterministic");
+
+        for channel in a {
+            assert!((30..=210).contains(&channel));
+        }
+
+        assert_ne!(
+            hash_color("minecraft:one_block"),
+            hash_color("minecraft:two_block"),
+            "distinct blocks should get distinct fallback colors"
+        );
+    }
+
+    #[test]
+    fn renders_a_16x16_png_with_expected_pixels() {
+        // Only column (x=0, z=0) has a block; everything else is void.
+        let blocks = std::array::from_fn(|i| {
+            (i == 0).then(|| "minecraft:grass_block".to_string())
+        });
+        let top = ChunkTop {
+            blocks,
+            heights: [None; COLUMNS],
+        };
+
+        let path = std::env::temp_dir().join("worldraw_test_chunk.png");
+        render_chunk_png(&top, &path).expect("render should succeed");
+
+        let img = image::open(&path).expect("png should be readable");
+        assert_eq!(img.dimensions(), (16, 16));
+
+        // Top-left pixel is the grass column.
+        assert_eq!(img.get_pixel(0, 0).0, [106, 170, 64, 255]);
+        // Every other column is void (black).
+        assert_eq!(img.get_pixel(1, 0).0, [0, 0, 0, 255]);
+        assert_eq!(img.get_pixel(15, 15).0, [0, 0, 0, 255]);
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
 

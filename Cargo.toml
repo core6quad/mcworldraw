@@ -5,5 +5,7 @@ edition = "2024"
 
 [dependencies]
 fastnbt = "2.6.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+indicatif = "0.17"
 mca = "2.1.2"
 serde = { version = "1", features = ["derive"] }
