@@ -2,6 +2,9 @@
 
 A tool to render top-down view of a Minecraft world
 
+<img width="865" height="364" alt="image" src="https://github.com/user-attachments/assets/3baf2d10-4e67-4474-84f0-c8ffd92680a1" />
+
+
 Supports modern versions of Java edition, legacy untested.
 
 ## Usage
