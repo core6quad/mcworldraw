@@ -29,3 +29,9 @@ cargo run --release -- "path/to/world" -s -r -hs -ao -t -b
 | `-b` | Bloom on lava, torches, and glowstone. Requires SuperSampling or HyperSampling |
 | `-t` | Transparency on water, allowing you to see underwater blocks |
 | `-n` | Night mode (WIP) |
+
+## Known problems
+
+ - Bloom looks bad
+ - Night looks bad
+ - A lot of block color defenitions are missing
