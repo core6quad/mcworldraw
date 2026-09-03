@@ -23,6 +23,7 @@ pub(crate) struct Args {
     pub(crate) supersample: bool,
     pub(crate) hypersample: bool,
     pub(crate) ambient_occlusion: bool,
+    pub(crate) bloom: bool,
     pub(crate) transparency: bool,
 }
 
@@ -74,6 +75,11 @@ pub(crate) fn print_usage() {
                              almost invisible toward the block's centre. Only\n\
                              available together with -ss/--supersample or\n\
                              -hs/--hypersampling\n\
+         -b, --bloom          Make light-emitting blocks (torches, lava,\n\
+                              glowstone, lanterns, ...) cast a radial gradient\n\
+                              of their light color onto the surrounding blocks.\n\
+                              Only available together with -ss/--supersample or\n\
+                              -hs/--hypersampling\n\
          -t, --transparency   Render water semi-transparently: a water surface\n\
                              is blended with the first non-water block beneath\n\
                              it, so the block under the water is faintly\n\
@@ -93,6 +99,7 @@ pub(crate) fn parse_args() -> Result<Args, String> {
     let mut supersample = false;
     let mut hypersample = false;
     let mut ambient_occlusion = false;
+    let mut bloom = false;
     let mut transparency = false;
 
     let raw: Vec<String> = env::args().skip(1).collect();
@@ -107,6 +114,7 @@ pub(crate) fn parse_args() -> Result<Args, String> {
             "--supersample" | "-ss" => supersample = true,
             "--hypersampling" | "--hypersample" | "-hs" => hypersample = true,
             "--ambient-occlusion" | "-ao" => ambient_occlusion = true,
+            "--bloom" | "-b" => bloom = true,
             "--transparency" | "-t" => transparency = true,
             "--help" | "-h" => {
                 print_usage();
@@ -166,6 +174,11 @@ pub(crate) fn parse_args() -> Result<Args, String> {
                 .into(),
         );
     }
+    if bloom && !(supersample || hypersample) {
+        return Err(
+            "--bloom (-b) requires --supersample (-ss) or --hypersampling (-hs)".into(),
+        );
+    }
 
     let world_path =
         world_path.ok_or_else(|| "Missing <path-to-world> argument".to_string())?;
@@ -179,6 +192,7 @@ pub(crate) fn parse_args() -> Result<Args, String> {
         supersample,
         hypersample,
         ambient_occlusion,
+        bloom,
         transparency,
     })
 }
@@ -233,6 +247,7 @@ mod tests {
             supersample,
             hypersample,
             ambient_occlusion: false,
+            bloom: false,
             transparency: false,
         };
         assert_eq!(args(false, false).upsample_factor(), None);

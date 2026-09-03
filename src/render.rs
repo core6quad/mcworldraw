@@ -12,8 +12,8 @@ use std::path::Path;
 use image::{Rgb, RgbImage};
 
 use crate::chunk::{ChunkTop, COLUMNS, VOID_H, CHUNK_SIZE};
-use crate::color::{apply_ao, display_color, shade, NO_BLOCK};
-use crate::light::ambient_occlusion;
+use crate::color::{apply_ao, display_color, light_bloom_color, shade, NO_BLOCK};
+use crate::light::{ambient_occlusion, bloom};
 
 /// Render the top-down view of a chunk as a PNG.
 ///
@@ -189,39 +189,58 @@ pub(crate) fn render_chunk_png_ss(
     Ok(())
 }
 
-/// Render the top-down view of a chunk as a supersampled PNG with ambient
-/// occlusion: each of the 16x16 blocks becomes a solid `scale x scale` pixel
-/// square (as in [`render_chunk_png_ss`]), but each block's edge facing a
-/// neighbour that is one block higher gets a soft black gradient (see
-/// [`ambient_occlusion`]).
+/// Render the top-down view of a chunk as a supersampled PNG, optionally
+/// layering ambient occlusion and/or light bloom on top of the solid
+/// `scale x scale` block squares (as in [`render_chunk_png_ss`]).
 ///
-/// AO is computed from the chunk's own columns, so the effect is correct
-/// within the chunk; the outermost edge blocks cannot see neighbours that
-/// belong to other chunks.
-pub(crate) fn render_chunk_png_ss_ao(
+/// `with_ao` darkens each block's edge facing a neighbour one block higher
+/// (see [`ambient_occlusion`]); `with_bloom` adds a radial gradient of light
+/// around light-emitting blocks (see [`bloom`]). Both are computed from the
+/// chunk's own columns, so the effects are correct within the chunk but the
+/// outermost edge blocks cannot see neighbours that belong to other chunks.
+pub(crate) fn render_chunk_png_ss_fx(
     top: &ChunkTop,
     out_path: &Path,
     scale: u32,
     transparency: bool,
+    with_ao: bool,
+    with_bloom: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let s = scale as usize;
     let size = CHUNK_SIZE * s;
     let mut img = RgbImage::new(size as u32, size as u32);
 
-    // Reuse the global AO routine on this chunk's 16x16 height grid (void
-    // columns keep the VOID_H sentinel so they neither cast nor receive).
-    let heights: Vec<i32> =
-        top.heights.iter().map(|h| h.unwrap_or(VOID_H)).collect();
-    let ao = ambient_occlusion(&heights, CHUNK_SIZE, CHUNK_SIZE, s);
+    let ao = if with_ao {
+        // Reuse the global AO routine on this chunk's 16x16 height grid (void
+        // columns keep the VOID_H sentinel so they neither cast nor receive).
+        let heights: Vec<i32> =
+            top.heights.iter().map(|h| h.unwrap_or(VOID_H)).collect();
+        Some(ambient_occlusion(&heights, CHUNK_SIZE, CHUNK_SIZE, s))
+    } else {
+        None
+    };
 
-    blit_supersampled_ao(
+    let bloom_field = if with_bloom {
+        // This chunk's per-block bloom colors (void / non-light -> black).
+        let lights: Vec<[u8; 3]> = top
+            .blocks
+            .iter()
+            .map(|b| b.as_deref().and_then(light_bloom_color).unwrap_or(NO_BLOCK))
+            .collect();
+        Some(bloom(&lights, CHUNK_SIZE, CHUNK_SIZE, s))
+    } else {
+        None
+    };
+
+    blit_supersampled_fx(
         &mut img,
         &top.blocks,
         &top.under,
         CHUNK_SIZE,
         CHUNK_SIZE,
         s,
-        &ao,
+        ao.as_deref(),
+        bloom_field.as_deref(),
         0,
         0,
         transparency,
@@ -233,17 +252,23 @@ pub(crate) fn render_chunk_png_ss_ao(
 }
 
 /// Like [`blit_supersampled`], but each block's `s x s` pixels are additionally
-/// darkened toward black according to a pixel-resolution `ao` field (0.0..=1.0,
-/// sized `region_w * s x region_h * s`, index = `z * region_w * s + x * s +`
-/// pixel offset).
-fn blit_supersampled_ao(
+/// darkened toward black by an ambient-occlusion field and/or brightened by an
+/// additive light-bloom field.
+///
+/// `ao`, when present, is a per-pixel darkening amount (0.0..=1.0); `bloom`,
+/// when present, is a per-pixel additive RGB amount. Both are sized
+/// `region_w * s x region_h * s` (index = `z * region_w * s + x * s +` pixel
+/// offset). AO darkens first, then bloom brightens, so a shadowed pixel next
+/// to a light still glows.
+fn blit_supersampled_fx(
     out: &mut RgbImage,
     blocks: &[Option<String>],
     under: &[Option<String>],
     region_w: usize,
     region_h: usize,
     s: usize,
-    ao: &[f32],
+    ao: Option<&[f32]>,
+    bloom: Option<&[[u8; 3]]>,
     origin_x: u32,
     origin_z: u32,
     transparency: bool,
@@ -261,7 +286,23 @@ fn blit_supersampled_ao(
                     let px = base_x + dx;
                     let pz = base_z + dz;
                     let pi = (pz as usize) * pw + (px as usize);
-                    let rgb = apply_ao(rgb, ao[pi]);
+                    let mut rgb = rgb;
+                    if let Some(ao) = ao {
+                        let a = ao[pi];
+                        if a > 0.0 {
+                            rgb = apply_ao(rgb, a);
+                        }
+                    }
+                    if let Some(bloom) = bloom {
+                        let b = bloom[pi];
+                        if b != [0, 0, 0] {
+                            rgb = [
+                                rgb[0].saturating_add(b[0]),
+                                rgb[1].saturating_add(b[1]),
+                                rgb[2].saturating_add(b[2]),
+                            ];
+                        }
+                    }
                     out.put_pixel(px, pz, Rgb(rgb));
                 }
             }
@@ -365,20 +406,23 @@ pub(crate) fn render_shaded_map(
 /// General supersampled fill: draw every block as a solid `s x s` pixel square
 /// of its base color (no interpolation between blocks), optionally darkening
 /// each pixel independently by an elevation shadow (`bool`) and/or an
-/// ambient-occlusion amount (`f32`, 0.0 = no darkening, 1.0 = fully black).
+/// ambient-occlusion amount (`f32`, 0.0 = no darkening, 1.0 = fully black),
+/// and/or brightening it additively by a light-bloom color (`[u8; 3]`).
 ///
 /// When `pixel_shadow` is provided it is a pixel-resolution mask (see
 /// [`supersampled_heights`]), so a block straddling the shadow edge gets a mix
 /// of lit and dark pixels and the diagonal shadow boundary stays smooth. When
-/// `pixel_ao` is provided it is a per-pixel darkening amount. Both masks, when
-/// present, are sized `grid_w * s x grid_h * s` (index = `z * grid_w * s +`
-/// `x * s +` pixel offset). Shadow is applied first, then AO, so the two
+/// `pixel_ao` is provided it is a per-pixel darkening amount and
+/// `pixel_bloom` a per-pixel additive RGB amount. All masks, when present, are
+/// sized `grid_w * s x grid_h * s` (index = `z * grid_w * s + x * s +` pixel
+/// offset). Shadow and AO darken first, then bloom brightens, so the three
 /// compose.
 pub(crate) fn render_ss(
     img: &mut RgbImage,
     colors: &[[u8; 3]],
     pixel_shadow: Option<&[bool]>,
     pixel_ao: Option<&[f32]>,
+    pixel_bloom: Option<&[[u8; 3]]>,
     grid_w: usize,
     grid_h: usize,
     s: usize,
@@ -406,6 +450,16 @@ pub(crate) fn render_ss(
                         let a = ao[pi];
                         if a > 0.0 {
                             rgb = apply_ao(rgb, a);
+                        }
+                    }
+                    if let Some(bloom) = pixel_bloom {
+                        let b = bloom[pi];
+                        if b != [0, 0, 0] {
+                            rgb = [
+                                rgb[0].saturating_add(b[0]),
+                                rgb[1].saturating_add(b[1]),
+                                rgb[2].saturating_add(b[2]),
+                            ];
                         }
                     }
                     img.put_pixel(px as u32, pz as u32, Rgb(rgb));
@@ -501,7 +555,7 @@ mod tests {
     use super::*;
     use crate::args::{HYPER_SAMPLE, SUPER_SAMPLE};
     use crate::palette::block_color;
-    use crate::light::{ambient_occlusion, compute_shadows, supersampled_heights};
+    use crate::light::{ambient_occlusion, bloom, compute_shadows, supersampled_heights};
     use image::GenericImageView;
 
     #[test]
@@ -698,7 +752,7 @@ mod tests {
         let pixel_shadow = compute_shadows(&pixel_heights, pw, ph);
 
         let mut img = RgbImage::new((grid_w * s) as u32, (grid_h * s) as u32);
-        render_ss(&mut img, &colors, Some(&pixel_shadow), None, grid_w, grid_h, s);
+        render_ss(&mut img, &colors, Some(&pixel_shadow), None, None, grid_w, grid_h, s);
 
         let lit = block_color("minecraft:sand");
         let dark = shade(lit);
@@ -781,7 +835,7 @@ mod tests {
         let ao = ambient_occlusion(&heights, grid_w, grid_h, s);
 
         let mut img = RgbImage::new((grid_w * s) as u32, (grid_h * s) as u32);
-        render_ss(&mut img, &colors, None, Some(&ao), grid_w, grid_h, s);
+        render_ss(&mut img, &colors, None, Some(&ao), None, grid_w, grid_h, s);
 
         let lit = block_color("minecraft:sand");
         // The lower block's edge pixel (facing the higher block) is darkened.
@@ -813,7 +867,7 @@ mod tests {
             under: std::array::from_fn(|_| None),
         };
         let path = std::env::temp_dir().join("worldraw_test_ao.png");
-        render_chunk_png_ss_ao(&top, &path, 16, false)
+        render_chunk_png_ss_fx(&top, &path, 16, false, true, false)
             .expect("render should succeed");
 
         let img = image::open(&path).expect("png should be readable");
@@ -832,5 +886,50 @@ mod tests {
         assert_eq!(img.get_pixel(0, s / 2).0, lit);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn render_ss_applies_bloom_glow_around_a_light() {
+        let grid_w = 5;
+        let grid_h = 1;
+        let s = 4usize;
+        let pw = grid_w * s;
+        // A black field with a single torch at block (x=2, z=0).
+        let colors = vec![[0u8, 0, 0]; grid_w * grid_h];
+        let mut lights = vec![[0u8, 0, 0]; grid_w * grid_h];
+        lights[2] = [255, 200, 90];
+        let bloom_field = bloom(&lights, grid_w, grid_h, s);
+
+        let mut img = RgbImage::new(pw as u32, (grid_h * s) as u32);
+        render_ss(
+            &mut img,
+            &colors,
+            None,
+            None,
+            Some(&bloom_field),
+            grid_w,
+            grid_h,
+            s,
+        );
+
+        // The torch's own square glows (base black + full bloom at its centre).
+        let center = img.get_pixel(2 * s as u32 + s as u32 / 2, 0).0;
+        assert!(
+            center[0] > 200 && center[1] > 150,
+            "the light block should glow, got {center:?}"
+        );
+        // A dark pixel inside the radius is brightened by the warm bloom.
+        let halo = img.get_pixel((2 * s + s / 2 + 2) as u32, 0).0;
+        assert_ne!(
+            halo,
+            [0, 0, 0],
+            "a pixel inside the radius should be lit by the bloom"
+        );
+        // A pixel beyond the radius stays black.
+        assert_eq!(
+            img.get_pixel(0, 0).0,
+            [0, 0, 0],
+            "outside the radius stays unlit"
+        );
     }
 }

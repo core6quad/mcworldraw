@@ -9,6 +9,15 @@
 
 use crate::chunk::VOID_H;
 
+/// How far a light block's bloom reaches, in whole blocks. Converted to pixels
+/// as `BLOOM_RADIUS_BLOCKS * s`, so the glow covers the same number of blocks
+/// at any resolution.
+pub(crate) const BLOOM_RADIUS_BLOCKS: f32 = 2.0;
+
+/// Peak additive strength of a bloom at its source: the full bloom color is
+/// added to the underlying pixel when this is 1.0.
+pub(crate) const BLOOM_STRENGTH: f32 = 1.0;
+
 /// Compute a per-column shadow mask for a top-down map lit by a 45 degree sun
 /// located at the top-right.
 ///
@@ -177,6 +186,78 @@ pub(crate) fn ambient_occlusion(
                         let pi = (base_z + dz) * pw + (base_x + dx);
                         out[pi] = dark;
                     }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Compute a per-pixel additive bloom field around light-emitting blocks, for
+/// the supersampled modes.
+///
+/// `lights` is a block-resolution `grid_w x grid_h` grid (index =
+/// `z * grid_w + x`) where each cell holds that block's bloom color (see
+/// [`crate::color::light_bloom_color`]) or `[0, 0, 0]` if it does not emit
+/// light. The result is a pixel-resolution `grid_w * s x grid_h * s` field of
+/// additive RGB amounts (index = `z * grid_w * s + x`) that the renderer adds
+/// to each pixel's base color (clamped at 255).
+///
+/// Each source radiates a radial gradient from the centre of its block: the
+/// added color is strongest at the source and fades to zero at
+/// [`BLOOM_RADIUS_BLOCKS`] blocks away, with a smooth quadratic falloff. When
+/// several sources overlap their amounts add, so a cluster of lights glows
+/// brighter than a lone one.
+pub(crate) fn bloom(
+    lights: &[[u8; 3]],
+    grid_w: usize,
+    grid_h: usize,
+    s: usize,
+) -> Vec<[u8; 3]> {
+    let pw = grid_w * s;
+    let ph = grid_h * s;
+    let mut out = vec![[0u8, 0, 0]; pw * ph];
+
+    let radius_px = (BLOOM_RADIUS_BLOCKS * s as f32) as usize;
+    if radius_px == 0 {
+        return out;
+    }
+    let r2 = radius_px as f32 * radius_px as f32;
+
+    for z in 0..grid_h {
+        for x in 0..grid_w {
+            let light = lights[z * grid_w + x];
+            if light == [0, 0, 0] {
+                continue;
+            }
+
+            // Centre of this block in pixel coordinates.
+            let cx = (x * s + s / 2) as f32;
+            let cz = (z * s + s / 2) as f32;
+
+            // Pixel bounding box that could lie within the bloom radius.
+            let base_x = (x * s) as i32;
+            let base_z = (z * s) as i32;
+            let rp = radius_px as i32;
+            let x0 = (base_x - rp).max(0);
+            let x1 = ((base_x + s as i32) + rp).min(pw as i32);
+            let z0 = (base_z - rp).max(0);
+            let z1 = ((base_z + s as i32) + rp).min(ph as i32);
+
+            for pz in z0..z1 {
+                for px in x0..x1 {
+                    let dx = px as f32 - cx;
+                    let dz = pz as f32 - cz;
+                    let d2 = dx * dx + dz * dz;
+                    if d2 > r2 {
+                        continue;
+                    }
+                    let f = BLOOM_STRENGTH * (1.0 - d2 / r2);
+                    let pi = (pz as usize) * pw + (px as usize);
+                    out[pi][0] = out[pi][0].saturating_add((light[0] as f32 * f) as u8);
+                    out[pi][1] = out[pi][1].saturating_add((light[1] as f32 * f) as u8);
+                    out[pi][2] = out[pi][2].saturating_add((light[2] as f32 * f) as u8);
                 }
             }
         }
@@ -398,5 +479,44 @@ mod tests {
         let heights = vec![5i32, VOID_H];
         let ao = ambient_occlusion(&heights, grid_w, grid_h, s);
         assert!(ao.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn bloom_fades_from_light_source_outward() {
+        let grid_w = 6;
+        let grid_h = 1;
+        let s = 4usize;
+        let mut lights = vec![[0u8, 0, 0]; grid_w * grid_h];
+        lights[2] = [255, 200, 90]; // a single warm light at block x=2
+
+        let pw = grid_w * s;
+
+        let field = bloom(&lights, grid_w, grid_h, s);
+
+        // Centre of the light block in pixel coordinates.
+        let cx = 2 * s + s / 2; // 10
+        let cz = s / 2;         // 2 (the z block is 0)
+        let center = field[cz * pw + cx];
+        assert_eq!(center, [255, 200, 90], "source centre should be at full strength");
+
+        // Along the horizontal centre line the bloom fades symmetrically.
+        let right = field[cz * pw + cx + 1];
+        let left = field[cz * pw + cx - 1];
+        assert_eq!(left, right, "falloff should be symmetric");
+        assert!(
+            right[0] < center[0] && right[1] < center[1],
+            "bloom should fade outward"
+        );
+        let further = field[cz * pw + cx + 2];
+        assert!(further[0] <= right[0], "further out should be dimmer still");
+
+        // Beyond the 2-block radius (radius = 8 px) there is no bloom.
+        assert_eq!(field[cz * pw + 0], [0, 0, 0], "far corner should be unlit");
+        assert_eq!(field[cz * pw + 1], [0, 0, 0], "far corner (other side) should be unlit");
+
+        // No channel ever exceeds its source color (additive, clamped).
+        for v in &field {
+            assert!(v[1] <= 200 && v[2] <= 90);
+        }
     }
 }

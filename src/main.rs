@@ -26,7 +26,7 @@ use args::{parse_args, print_usage, HYPER_SAMPLE, SUPER_SAMPLE};
 use chunk::{CHUNK_SIZE, VOID_H};
 use color::NO_BLOCK;
 use dimension::{dimension_info, dimension_region_path};
-use light::{ambient_occlusion, compute_shadows, supersampled_heights};
+use light::{ambient_occlusion, bloom, compute_shadows, supersampled_heights};
 use region::{
     collect_grid, process_region, process_region_single, process_region_single_ss, scan_region,
     Bounds,
@@ -167,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut img = RgbImage::new(width, height);
 
-        if args.shadows || args.ambient_occlusion {
+        if args.shadows || args.ambient_occlusion || args.bloom {
             // Shadow rendering is done over the whole map:
             //
             //   1. One pass over the region files fills two global grids -- the
@@ -189,12 +189,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut heights = vec![VOID_H; n];
             let mut colors = vec![NO_BLOCK; n];
+            let mut lights = vec![NO_BLOCK; n];
 
             for path in &region_files {
                 collect_grid(
                     path,
                     &mut heights,
                     &mut colors,
+                    &mut lights,
                     grid_w,
                     bounds.min_x,
                     bounds.min_z,
@@ -220,12 +222,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 };
                 drop(heights);
+                let pixel_bloom = if args.bloom {
+                    Some(bloom(&lights, grid_w, grid_h, s))
+                } else {
+                    None
+                };
+                drop(lights);
 
                 render_ss(
                     &mut img,
                     &colors,
                     pixel_shadow.as_deref(),
                     pixel_ao.as_deref(),
+                    pixel_bloom.as_deref(),
                     grid_w,
                     grid_h,
                     s,
@@ -305,6 +314,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.upsample_factor().unwrap_or(1),
             dim.out_prefix,
             args.ambient_occlusion,
+            args.bloom,
             args.transparency,
             &pb,
         )?;

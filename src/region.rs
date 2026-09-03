@@ -17,9 +17,9 @@ use indicatif::ProgressBar;
 use mca::RegionReader;
 
 use crate::chunk::{get_top_blocks, Chunk, CHUNK_SIZE, VOID_H};
-use crate::color::display_color;
+use crate::color::{display_color, light_bloom_color, NO_BLOCK};
 use crate::render::{
-    blit_supersampled, render_chunk_png, render_chunk_png_ss, render_chunk_png_ss_ao, render_into_big,
+    blit_supersampled, render_chunk_png, render_chunk_png_ss, render_chunk_png_ss_fx, render_into_big,
 };
 
 /// Bounding box of chunk coordinates, in chunk units (not blocks).
@@ -48,7 +48,8 @@ impl Bounds {
 ///
 /// `upsample > 1` switches to the supersampled renderer (each block becomes a
 /// solid `upsample x upsample` square); `ambient_occlusion` layers the soft
-/// edge darkening on top of that. Otherwise each chunk is drawn at `scale`.
+/// edge darkening on top of that and `bloom` layers a radial light gradient
+/// around light-emitting blocks. Otherwise each chunk is drawn at `scale`.
 pub(crate) fn process_region(
     path: &Path,
     out_dir: &Path,
@@ -56,6 +57,7 @@ pub(crate) fn process_region(
     upsample: u32,
     dim_prefix: &str,
     ambient_occlusion: bool,
+    bloom: bool,
     transparency: bool,
     pb: &ProgressBar,
 ) -> Result<usize, Box<dyn std::error::Error>> {
@@ -95,8 +97,15 @@ pub(crate) fn process_region(
 
             let out_path = out_dir.join(format!("{dim_prefix}c_{chunk_x}_{chunk_z}.png"));
             if upsample > 1 {
-                if ambient_occlusion {
-                    render_chunk_png_ss_ao(&top, &out_path, upsample, transparency)?;
+                if ambient_occlusion || bloom {
+                    render_chunk_png_ss_fx(
+                        &top,
+                        &out_path,
+                        upsample,
+                        transparency,
+                        ambient_occlusion,
+                        bloom,
+                    )?;
                 } else {
                     render_chunk_png_ss(&top, &out_path, upsample, transparency)?;
                 }
@@ -185,16 +194,18 @@ pub(crate) fn parse_region_coords(path: &Path) -> Option<(i32, i32)> {
     Some((x, z))
 }
 
-/// Fill the shared `heights` / `colors` grids (in block units, covering the
-/// world bounding box) with this region file's chunk data.
+/// Fill the shared `heights` / `colors` / `lights` grids (in block units,
+/// covering the world bounding box) with this region file's chunk data.
 ///
 /// `grid_w` is the width of the grids in blocks; `min_chunk_x` / `min_chunk_z`
 /// are the world's minimum chunk coordinates. A `None` column is recorded as
-/// [`VOID_H`] with the no-block color.
+/// [`VOID_H`] with the no-block color. `lights` holds each column's bloom color
+/// (or the no-block color when it does not emit light).
 pub(crate) fn collect_grid(
     path: &Path,
     heights: &mut [i32],
     colors: &mut [[u8; 3]],
+    lights: &mut [[u8; 3]],
     grid_w: usize,
     min_chunk_x: i32,
     min_chunk_z: i32,
@@ -242,6 +253,11 @@ pub(crate) fn collect_grid(
                     let ci = lz * CHUNK_SIZE + lx;
                     heights[gi] = top.heights[ci].unwrap_or(VOID_H);
                     colors[gi] = display_color(&top.blocks[ci], &top.under[ci], transparency);
+                    lights[gi] = top
+                        .blocks[ci]
+                        .as_deref()
+                        .and_then(light_bloom_color)
+                        .unwrap_or(NO_BLOCK);
                 }
             }
 

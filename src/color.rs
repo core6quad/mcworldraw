@@ -87,6 +87,39 @@ pub(crate) fn display_color(
     }
 }
 
+/// The additive "bloom" color a light-emitting block casts onto its
+/// surroundings when `--bloom` is enabled (see [`crate::light::bloom`]).
+///
+/// Returns `Some(color)` for blocks that emit light (torches, lava, glowstone,
+/// lanterns, ...) and `None` otherwise. The returned color is what gets
+/// additively blended onto nearby pixels, strongest at the source and fading
+/// out with distance.
+pub(crate) fn light_bloom_color(name: &str) -> Option<[u8; 3]> {
+    match name {
+        "minecraft:torch"
+        | "minecraft:redstone_torch"
+        | "minecraft:lit_redstone_torch"
+        | "minecraft:lantern"
+        | "minecraft:campfire"
+        | "minecraft:lit_pumpkin"
+        | "minecraft:lit_redstone_lamp" => Some([255, 200, 90]),
+        "minecraft:glowstone" => Some([255, 225, 140]),
+        "minecraft:lava" | "minecraft:flowing_lava" => Some([255, 130, 30]),
+        "minecraft:soul_torch" | "minecraft:soul_lantern" | "minecraft:soul_campfire" => {
+            Some([110, 200, 220])
+        }
+        "minecraft:sea_lantern" => Some([180, 240, 235]),
+        "minecraft:shroomlight" => Some([235, 160, 120]),
+        "minecraft:beacon" => Some([160, 225, 245]),
+        "minecraft:sea_pickle" => Some([150, 220, 130]),
+        "minecraft:end_rod" => Some([210, 235, 190]),
+        "minecraft:glow_lichen" => Some([130, 230, 160]),
+        "minecraft:glow_berries" => Some([235, 130, 165]),
+        "minecraft:crying_obsidian" => Some([150, 90, 200]),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +199,16 @@ mod tests {
                 .sum::<i32>()
         };
         assert!(dist(blended, water_color) < dist(blended, dirt_color));
+    }
+
+    #[test]
+    fn light_bloom_color_is_only_for_emitters() {
+        assert_eq!(light_bloom_color("minecraft:torch"), Some([255, 200, 90]));
+        assert_eq!(light_bloom_color("minecraft:lava"), Some([255, 130, 30]));
+        assert_eq!(light_bloom_color("minecraft:glowstone"), Some([255, 225, 140]));
+        assert_eq!(light_bloom_color("minecraft:glow_lichen"), Some([130, 230, 160]));
+        // Non-light blocks emit nothing.
+        assert_eq!(light_bloom_color("minecraft:grass_block"), None);
+        assert_eq!(light_bloom_color("minecraft:air"), None);
     }
 }
