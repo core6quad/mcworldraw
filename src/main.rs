@@ -32,6 +32,11 @@ const SHADOW_DENOMINATOR: u32 = 100;
 /// interpolation between blocks.
 const SUPER_SAMPLE: u32 = 5;
 
+/// Hypersampling factor for `--hypersampling`: each block is drawn as a solid
+/// `HYPER_SAMPLE x HYPER_SAMPLE` pixel square (15 pixels per block) with no
+/// interpolation between blocks. Like `SUPER_SAMPLE` but zoomed in 3x.
+const HYPER_SAMPLE: u32 = 15;
+
 #[derive(Debug, Deserialize)]
 struct Chunk {
     #[serde(default)]
@@ -105,6 +110,22 @@ struct Args {
     dim: i32,
     shadows: bool,
     supersample: bool,
+    hypersample: bool,
+}
+
+impl Args {
+    /// Pixels-per-block upsample factor: `Some(15)` for `--hypersampling`,
+    /// `Some(5)` for `--supersample`, or `None` for native / `--scale` mode
+    /// (in which case [`Args::scale`] applies instead).
+    fn upsample_factor(&self) -> Option<u32> {
+        if self.hypersample {
+            Some(HYPER_SAMPLE)
+        } else if self.supersample {
+            Some(SUPER_SAMPLE)
+        } else {
+            None
+        }
+    }
 }
 
 fn print_usage() {
@@ -125,7 +146,13 @@ fn print_usage() {
                               (5 pixels per block, no interpolation). When\n\
                               shadows are enabled they are resolved at pixel\n\
                               resolution so their edges stay smooth. Cannot be\n\
-                              combined with -z/--scale\n\
+                              combined with -hs/--hypersampling or -z/--scale\n\
+         -hs, --hypersampling Render each block as a solid 15x15 pixel square\n\
+                              (15 pixels per block, no interpolation) -- like\n\
+                              -ss but zoomed in 3x. When shadows are enabled\n\
+                              they are resolved at pixel resolution so their\n\
+                              edges stay smooth. Cannot be combined with\n\
+                              -ss/--supersample or -z/--scale\n\
          -h, --help           Show this message"
     );
 }
@@ -138,6 +165,7 @@ fn parse_args() -> Result<Args, String> {
     let mut dim: i32 = 0;
     let mut shadows = false;
     let mut supersample = false;
+    let mut hypersample = false;
 
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -149,6 +177,7 @@ fn parse_args() -> Result<Args, String> {
             "--single" | "--big" | "-s" => single = true,
             "--shadows" | "--shadow" | "-r" => shadows = true,
             "--supersample" | "-ss" => supersample = true,
+            "--hypersampling" | "--hypersample" | "-hs" => hypersample = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -186,6 +215,16 @@ fn parse_args() -> Result<Args, String> {
         i += 1;
     }
 
+    if supersample && hypersample {
+        return Err(
+            "--supersample (-ss) and --hypersampling (-hs) cannot be combined".into(),
+        );
+    }
+    if hypersample && scale_set {
+        return Err(
+            "--hypersampling (-hs) cannot be combined with --scale (-z/--scale)".into(),
+        );
+    }
     if supersample && scale_set {
         return Err(
             "--supersample (-ss) cannot be combined with --scale (-z/--scale)".into(),
@@ -195,7 +234,7 @@ fn parse_args() -> Result<Args, String> {
     let world_path =
         world_path.ok_or_else(|| "Missing <path-to-world> argument".to_string())?;
 
-    Ok(Args { world_path, single, scale, dim, shadows, supersample })
+    Ok(Args { world_path, single, scale, dim, shadows, supersample, hypersample })
 }
 
 /// Parse and validate a `--scale` value: a positive integer (>= 1).
@@ -512,30 +551,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bounds = world_bounds.expect("bounds must exist when chunks exist");
 
         let scale = args.scale as i32;
-        let ss = if args.supersample { SUPER_SAMPLE as i32 } else { 1 };
+        // `None` = native / `--scale` mode (downsampling, `scale` applies);
+        // `Some(n)` = upsample to `n` pixels per block (5 for -ss, 15 for -hs).
+        let upsample = args.upsample_factor();
+        let ss = upsample.unwrap_or(1) as i32;
         let blocks_w = (bounds.max_x - bounds.min_x + 1) * (CHUNK_SIZE as i32);
         let blocks_h = (bounds.max_z - bounds.min_z + 1) * (CHUNK_SIZE as i32);
 
-        // In supersample mode each block becomes a solid `ss x ss` pixel square
+        // In upsample mode each block becomes a solid `ss x ss` pixel square
         // (upsampling), so the image is larger by that factor. Otherwise each
         // output pixel covers `scale x scale` blocks (downsampling), so the
         // image is smaller by that factor (rounded up to a whole pixel).
-        let width = if args.supersample {
+        let width = if upsample.is_some() {
             blocks_w * ss
         } else {
             (blocks_w + scale - 1) / scale
         };
-        let height = if args.supersample {
+        let height = if upsample.is_some() {
             blocks_h * ss
         } else {
             (blocks_h + scale - 1) / scale
         };
         let (width, height) = (width as u32, height as u32);
 
-        let res_desc = if args.supersample {
-            format!("supersampled {} px/block", SUPER_SAMPLE)
-        } else {
-            format!("scale {}", args.scale)
+        let res_desc = match upsample {
+            Some(SUPER_SAMPLE) => format!("supersampled {} px/block", SUPER_SAMPLE),
+            Some(HYPER_SAMPLE) => format!("hypersampled {} px/block", HYPER_SAMPLE),
+            Some(n) => format!("{} px/block", n),
+            None => format!("scale {}", args.scale),
         };
         let shadows_note = if args.shadows { " with shadows" } else { "" };
         println!(
@@ -563,9 +606,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             //   3. The image is filled in-memory from those grids, darkening
             //      shadowed columns. No second region read is needed.
             //
-            // In supersample mode the shadow is resolved at pixel resolution
-            // (see `supersampled_heights`) so its diagonal edges stay smooth
-            // even though the block colors are drawn as solid squares.
+            // In upsample mode (-ss / -hs) the shadow is resolved at pixel
+            // resolution (see `supersampled_heights`) so its diagonal edges
+            // stay smooth even though the block colors are drawn as solid
+            // squares.
             let grid_w = blocks_w as usize;
             let grid_h = blocks_h as usize;
             let n = grid_w * grid_h;
@@ -585,8 +629,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
 
-            if args.supersample {
-                let s = SUPER_SAMPLE as usize;
+            if let Some(factor) = upsample {
+                let s = factor as usize;
                 let pw = grid_w * s;
                 let ph = grid_h * s;
                 let pixel_heights = supersampled_heights(&heights, grid_w, grid_h, s);
@@ -611,8 +655,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     args.scale,
                 );
             }
-        } else if args.supersample {
-            let s = SUPER_SAMPLE as i32;
+        } else if let Some(factor) = upsample {
+            let s = factor as i32;
             for path in &region_files {
                 process_region_single_ss(
                     path,
@@ -661,7 +705,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     for path in &region_files {
-        process_region(path, out_dir, args.scale, args.supersample, dim.out_prefix, &pb)?;
+        process_region(
+            path,
+            out_dir,
+            args.scale,
+            args.upsample_factor().unwrap_or(1),
+            dim.out_prefix,
+            &pb,
+        )?;
     }
 
     pb.finish_with_message("Done");
@@ -677,7 +728,7 @@ fn process_region(
     path: &Path,
     out_dir: &Path,
     scale: u32,
-    supersample: bool,
+    upsample: u32,
     dim_prefix: &str,
     pb: &ProgressBar,
 ) -> Result<usize, Box<dyn std::error::Error>> {
@@ -717,8 +768,8 @@ fn process_region(
 
             let out_path =
                 out_dir.join(format!("{dim_prefix}c_{chunk_x}_{chunk_z}.png"));
-            if supersample {
-                render_chunk_png_ss(&top, &out_path, SUPER_SAMPLE)?;
+            if upsample > 1 {
+                render_chunk_png_ss(&top, &out_path, upsample)?;
             } else {
                 render_chunk_png(&top, &out_path, scale)?;
             }
@@ -1050,7 +1101,7 @@ fn compute_shadows(heights: &[i32], grid_w: usize, grid_h: usize) -> Vec<bool> {
 
 /// Upsample a block-resolution height grid to pixel resolution by nearest
 /// neighbor, so the shadow can be computed at pixel resolution in
-/// `--supersample` mode.
+/// `--supersample` / `--hypersampling` mode.
 ///
 /// Real columns are multiplied by `s` while void columns keep the [`VOID_H`]
 /// sentinel. Multiplying the heights (rather than only the grid size) keeps the
@@ -2179,6 +2230,97 @@ mod tests {
         assert!(
             found_partial,
             "a block should be partially shadowed along the smooth edge"
+        );
+    }
+
+    #[test]
+    fn hypersample_renders_solid_15x15_blocks_without_interpolation() {
+        // Only block (x=0, z=0) is grass; everything else is void.
+        let top = ChunkTop {
+            blocks: std::array::from_fn(|i| {
+                (i == 0).then(|| "minecraft:grass_block".to_string())
+            }),
+            heights: [None; COLUMNS],
+        };
+
+        let path = std::env::temp_dir().join("worldraw_test_hs.png");
+        render_chunk_png_ss(&top, &path, HYPER_SAMPLE).expect("render should succeed");
+
+        let img = image::open(&path).expect("png should be readable");
+        assert_eq!(img.dimensions(), (16 * 15, 16 * 15));
+
+        // The grass block at (0,0) is a solid 15x15 grass square.
+        for z in 0..15u32 {
+            for x in 0..15u32 {
+                assert_eq!(img.get_pixel(x, z).0, [106, 170, 64, 255]);
+            }
+        }
+        // The neighbouring block (1,0) is void -> black.
+        assert_eq!(img.get_pixel(15, 0).0, [0, 0, 0, 255]);
+        assert_eq!(img.get_pixel(239, 239).0, [0, 0, 0, 255]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upsample_factor_selects_the_requested_mode() {
+        let args = |supersample: bool, hypersample: bool| Args {
+            world_path: String::new(),
+            single: false,
+            scale: 1,
+            dim: 0,
+            shadows: false,
+            supersample,
+            hypersample,
+        };
+        assert_eq!(args(false, false).upsample_factor(), None);
+        assert_eq!(args(true, false).upsample_factor(), Some(SUPER_SAMPLE));
+        assert_eq!(args(false, true).upsample_factor(), Some(HYPER_SAMPLE));
+        // Hypersample wins if both were somehow set (parse_args forbids it).
+        assert_eq!(args(true, true).upsample_factor(), Some(HYPER_SAMPLE));
+    }
+
+    #[test]
+    fn hypersample_shadow_is_smooth_at_pixel_resolution() {
+        let grid_w = 8;
+        let grid_h = 8;
+        let s = HYPER_SAMPLE as usize;
+        // Flat field at height 0 with a single pillar of height 3 at (x=4, z=1).
+        let mut heights = vec![0i32; grid_w * grid_h];
+        heights[1 * grid_w + 4] = 3;
+
+        let pixel_heights = supersampled_heights(&heights, grid_w, grid_h, s);
+        let pw = grid_w * s;
+        let ph = grid_h * s;
+        let shadow = compute_shadows(&pixel_heights, pw, ph);
+
+        // A smooth, pixel-resolved shadow means some single block straddles the
+        // edge: within its 15x15 pixels there is a mix of lit and shadowed
+        // pixels (a block-resolved shadow would make each block uniformly
+        // lit or dark).
+        let mut found_partial = false;
+        for z in 0..grid_h {
+            for x in 0..grid_w {
+                let mut lit = 0;
+                let mut dark = 0;
+                for dz in 0..s {
+                    for dx in 0..s {
+                        let pi = (z * s + dz) * pw + (x * s + dx);
+                        if shadow[pi] {
+                            dark += 1;
+                        } else {
+                            lit += 1;
+                        }
+                    }
+                }
+                if lit > 0 && dark > 0 {
+                    found_partial = true;
+                }
+            }
+        }
+        assert!(
+            found_partial,
+            "a block should straddle the smooth shadow edge at pixel resolution"
         );
     }
 }
