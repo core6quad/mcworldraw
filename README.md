@@ -35,3 +35,4 @@ cargo run --release -- "path/to/world" -s -r -hs -ao -t -b
  - Bloom looks bad
  - Night looks bad
  - A lot of block color defenitions are missing
+ - Dosen't know what a solid/unsolid block is
