@@ -40,6 +40,14 @@ const SUPER_SAMPLE: u32 = 5;
 /// interpolation between blocks. Like `SUPER_SAMPLE` but zoomed in 3x.
 const HYPER_SAMPLE: u32 = 15;
 
+/// Transparency blend weights for `--transparency`. When a column's surface is
+/// water, its color is blended with the first solid block beneath it so that
+/// the block below is only *barely* visible through the water: the water color
+/// is multiplied by `WATER_OVER` and the block-beneath color by
+/// `WATER_UNDER`. `WATER_OVER >> WATER_UNDER` keeps the block faint.
+const WATER_OVER: u32 = 5;
+const WATER_UNDER: u32 = 1;
+
 #[derive(Debug, Deserialize)]
 struct Chunk {
     #[serde(default)]
@@ -82,6 +90,14 @@ struct ChunkTop {
     ///
     /// Used by the shadow pass to compute elevation-based shadows.
     heights: [Option<i32>; COLUMNS],
+
+    /// When the top block is water, the name of the first non-water, non-air
+    /// block beneath it (the lake/sea floor seen through the water), or `None`
+    /// if there is no such block or the surface is not water.
+    ///
+    /// Only populated to support `--transparency`, where a water column is
+    /// blended with this block's color.
+    under: [Option<String>; COLUMNS],
 }
 
 /// Bounding box of chunk coordinates, in chunk units (not blocks).
@@ -115,6 +131,7 @@ struct Args {
     supersample: bool,
     hypersample: bool,
     ambient_occlusion: bool,
+    transparency: bool,
 }
 
 impl Args {
@@ -164,6 +181,10 @@ fn print_usage() {
                               almost invisible toward the block's centre. Only\n\
                               available together with -ss/--supersample or\n\
                               -hs/--hypersampling\n\
+         -t, --transparency   Render water semi-transparently: a water surface\n\
+                              is blended with the first non-water block beneath\n\
+                              it, so the block under the water is faintly\n\
+                              visible\n\
          -h, --help           Show this message"
     );
 }
@@ -178,6 +199,7 @@ fn parse_args() -> Result<Args, String> {
     let mut supersample = false;
     let mut hypersample = false;
     let mut ambient_occlusion = false;
+    let mut transparency = false;
 
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -191,6 +213,7 @@ fn parse_args() -> Result<Args, String> {
             "--supersample" | "-ss" => supersample = true,
             "--hypersampling" | "--hypersample" | "-hs" => hypersample = true,
             "--ambient-occlusion" | "-ao" => ambient_occlusion = true,
+            "--transparency" | "-t" => transparency = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -262,6 +285,7 @@ fn parse_args() -> Result<Args, String> {
         supersample,
         hypersample,
         ambient_occlusion,
+        transparency,
     })
 }
 
@@ -654,6 +678,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     grid_w,
                     bounds.min_x,
                     bounds.min_z,
+                    args.transparency,
                     &pb,
                 )?;
             }
@@ -710,6 +735,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     bounds.min_x,
                     bounds.min_z,
                     s,
+                    args.transparency,
                     &pb,
                 )?;
             }
@@ -721,6 +747,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     bounds.min_x,
                     bounds.min_z,
                     args.scale,
+                    args.transparency,
                     &pb,
                 )?;
             }
@@ -758,6 +785,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.upsample_factor().unwrap_or(1),
             dim.out_prefix,
             args.ambient_occlusion,
+            args.transparency,
             &pb,
         )?;
     }
@@ -778,6 +806,7 @@ fn process_region(
     upsample: u32,
     dim_prefix: &str,
     ambient_occlusion: bool,
+    transparency: bool,
     pb: &ProgressBar,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let Some((region_x, region_z)) = parse_region_coords(path) else {
@@ -818,12 +847,12 @@ fn process_region(
                 out_dir.join(format!("{dim_prefix}c_{chunk_x}_{chunk_z}.png"));
             if upsample > 1 {
                 if ambient_occlusion {
-                    render_chunk_png_ss_ao(&top, &out_path, upsample)?;
+                    render_chunk_png_ss_ao(&top, &out_path, upsample, transparency)?;
                 } else {
-                    render_chunk_png_ss(&top, &out_path, upsample)?;
+                    render_chunk_png_ss(&top, &out_path, upsample, transparency)?;
                 }
             } else {
-                render_chunk_png(&top, &out_path, scale)?;
+                render_chunk_png(&top, &out_path, scale, transparency)?;
             }
 
             generated += 1;
@@ -919,12 +948,23 @@ fn render_chunk_png(
     top: &ChunkTop,
     out_path: &Path,
     scale: u32,
+    transparency: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let size = (CHUNK_SIZE + scale as usize - 1) / scale as usize;
 
     let mut img = RgbImage::new(size as u32, size as u32);
 
-    blit_scaled(&mut img, &top.blocks, CHUNK_SIZE, CHUNK_SIZE, scale, 0, 0);
+    blit_scaled(
+        &mut img,
+        &top.blocks,
+        &top.under,
+        CHUNK_SIZE,
+        CHUNK_SIZE,
+        scale,
+        0,
+        0,
+        transparency,
+    );
 
     img.save(out_path)?;
 
@@ -943,8 +983,19 @@ fn render_into_big(
     offset_x: u32,
     offset_z: u32,
     scale: u32,
+    transparency: bool,
 ) {
-    blit_scaled(img, &top.blocks, CHUNK_SIZE, CHUNK_SIZE, scale, offset_x, offset_z);
+    blit_scaled(
+        img,
+        &top.blocks,
+        &top.under,
+        CHUNK_SIZE,
+        CHUNK_SIZE,
+        scale,
+        offset_x,
+        offset_z,
+        transparency,
+    );
 }
 
 /// Write a downsampled top-down view of a rectangular block region into
@@ -960,11 +1011,13 @@ fn render_into_big(
 fn blit_scaled(
     out: &mut RgbImage,
     blocks: &[Option<String>],
+    under: &[Option<String>],
     region_w: usize,
     region_h: usize,
     scale: u32,
     origin_x: u32,
     origin_z: u32,
+    transparency: bool,
 ) {
     let scale = scale.max(1) as usize;
 
@@ -972,10 +1025,8 @@ fn blit_scaled(
     if scale == 1 {
         for z in 0..region_h {
             for x in 0..region_w {
-                let rgb = match &blocks[z * region_w + x] {
-                    Some(name) => block_color(name),
-                    None => NO_BLOCK,
-                };
+                let i = z * region_w + x;
+                let rgb = display_color(&blocks[i], &under[i], transparency);
                 out.put_pixel(origin_x + x as u32, origin_z + z as u32, Rgb(rgb));
             }
         }
@@ -992,7 +1043,7 @@ fn blit_scaled(
             let x1 = (x0 + scale).min(region_w);
             let z1 = (z0 + scale).min(region_h);
 
-            let rgb = most_common_color(blocks, region_w, x0, x1, z0, z1);
+            let rgb = most_common_color(blocks, under, region_w, x0, x1, z0, z1, transparency);
 
             out.put_pixel(origin_x + cx as u32, origin_z + cz as u32, Rgb(rgb));
         }
@@ -1009,19 +1060,19 @@ fn blit_scaled(
 fn blit_supersampled(
     out: &mut RgbImage,
     blocks: &[Option<String>],
+    under: &[Option<String>],
     region_w: usize,
     region_h: usize,
     s: usize,
     origin_x: u32,
     origin_z: u32,
+    transparency: bool,
 ) {
     let s = s.max(1);
     for z in 0..region_h {
         for x in 0..region_w {
-            let rgb = match &blocks[z * region_w + x] {
-                Some(name) => block_color(name),
-                None => NO_BLOCK,
-            };
+            let i = z * region_w + x;
+            let rgb = display_color(&blocks[i], &under[i], transparency);
             let base_x = origin_x + (x as u32) * (s as u32);
             let base_z = origin_z + (z as u32) * (s as u32);
             for dz in 0..s as u32 {
@@ -1040,10 +1091,21 @@ fn render_chunk_png_ss(
     top: &ChunkTop,
     out_path: &Path,
     scale: u32,
+    transparency: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let size = CHUNK_SIZE * scale as usize;
     let mut img = RgbImage::new(size as u32, size as u32);
-    blit_supersampled(&mut img, &top.blocks, CHUNK_SIZE, CHUNK_SIZE, scale as usize, 0, 0);
+    blit_supersampled(
+        &mut img,
+        &top.blocks,
+        &top.under,
+        CHUNK_SIZE,
+        CHUNK_SIZE,
+        scale as usize,
+        0,
+        0,
+        transparency,
+    );
     img.save(out_path)?;
 
     Ok(())
@@ -1062,6 +1124,7 @@ fn render_chunk_png_ss_ao(
     top: &ChunkTop,
     out_path: &Path,
     scale: u32,
+    transparency: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let s = scale as usize;
     let size = CHUNK_SIZE * s;
@@ -1076,12 +1139,14 @@ fn render_chunk_png_ss_ao(
     blit_supersampled_ao(
         &mut img,
         &top.blocks,
+        &top.under,
         CHUNK_SIZE,
         CHUNK_SIZE,
         s,
         &ao,
         0,
         0,
+        transparency,
     );
 
     img.save(out_path)?;
@@ -1096,21 +1161,21 @@ fn render_chunk_png_ss_ao(
 fn blit_supersampled_ao(
     out: &mut RgbImage,
     blocks: &[Option<String>],
+    under: &[Option<String>],
     region_w: usize,
     region_h: usize,
     s: usize,
     ao: &[f32],
     origin_x: u32,
     origin_z: u32,
+    transparency: bool,
 ) {
     let s = s.max(1);
     let pw = region_w * s;
     for z in 0..region_h {
         for x in 0..region_w {
-            let rgb = match &blocks[z * region_w + x] {
-                Some(name) => block_color(name),
-                None => NO_BLOCK,
-            };
+            let i = z * region_w + x;
+            let rgb = display_color(&blocks[i], &under[i], transparency);
             let base_x = origin_x + (x as u32) * (s as u32);
             let base_z = origin_z + (z as u32) * (s as u32);
             for dz in 0..s as u32 {
@@ -1129,41 +1194,44 @@ fn blit_supersampled_ao(
 /// Color of the most common block within the block rectangle
 /// `[x0, x1) x [z0, z1)`.
 ///
-/// Ties resolve to whichever block reaches the leading count first in
-/// row-major scan order, so the result is deterministic. Returns `NO_BLOCK`
-/// for an all-void area.
+/// Each column is resolved to its display color (see [`display_color`], which
+/// applies water transparency when enabled), and the most common color wins.
+/// Ties resolve to whichever color reaches the leading count first in
+/// row-major scan order, so the result is deterministic. Void columns are
+/// ignored; an all-void area returns `NO_BLOCK`.
 fn most_common_color(
     blocks: &[Option<String>],
+    under: &[Option<String>],
     region_w: usize,
     x0: usize,
     x1: usize,
     z0: usize,
     z1: usize,
+    transparency: bool,
 ) -> [u8; 3] {
-    let mut counts: HashMap<&str, u32> = HashMap::new();
-    let mut best_name: Option<&str> = None;
+    let mut counts: HashMap<[u8; 3], u32> = HashMap::new();
+    let mut best: Option<[u8; 3]> = None;
     let mut best_count: u32 = 0;
 
     for z in z0..z1 {
         for x in x0..x1 {
-            let Some(name) = blocks[z * region_w + x].as_deref() else {
+            let i = z * region_w + x;
+            let rgb = display_color(&blocks[i], &under[i], transparency);
+            if rgb == NO_BLOCK {
                 continue;
-            };
+            }
 
-            let count = counts.entry(name).or_insert(0);
+            let count = counts.entry(rgb).or_insert(0);
             *count += 1;
 
             if *count > best_count {
                 best_count = *count;
-                best_name = Some(name);
+                best = Some(rgb);
             }
         }
     }
 
-    match best_name {
-        Some(name) => block_color(name),
-        None => NO_BLOCK,
-    }
+    best.unwrap_or(NO_BLOCK)
 }
 
 /// Darken a color to its "in shadow" appearance by scaling every channel by
@@ -1277,6 +1345,7 @@ fn collect_grid(
     grid_w: usize,
     min_chunk_x: i32,
     min_chunk_z: i32,
+    transparency: bool,
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some((region_x, region_z)) = parse_region_coords(path) else {
@@ -1319,16 +1388,11 @@ fn collect_grid(
                     let gz = (block_z0 + lz as i32) as usize;
                     let gi = gz * grid_w + gx;
 
-                    match &top.blocks[lz * CHUNK_SIZE + lx] {
-                        Some(name) => {
-                            heights[gi] =
-                                top.heights[lz * CHUNK_SIZE + lx].unwrap_or(VOID_H);
-                            colors[gi] = block_color(name);
-                        }
-                        None => {
-                            heights[gi] = VOID_H;
-                            colors[gi] = NO_BLOCK;
-                        }
+                    {
+                        let ci = lz * CHUNK_SIZE + lx;
+                        heights[gi] = top.heights[ci].unwrap_or(VOID_H);
+                        colors[gi] =
+                            display_color(&top.blocks[ci], &top.under[ci], transparency);
                     }
                 }
             }
@@ -1636,6 +1700,7 @@ fn process_region_single(
     min_chunk_x: i32,
     min_chunk_z: i32,
     scale: u32,
+    transparency: bool,
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some((region_x, region_z)) = parse_region_coords(path) else {
@@ -1674,7 +1739,14 @@ fn process_region_single(
             let offset_x = ((chunk_x - min_chunk_x) * (CHUNK_SIZE as i32)) / s;
             let offset_z = ((chunk_z - min_chunk_z) * (CHUNK_SIZE as i32)) / s;
 
-            render_into_big(img, &top, offset_x as u32, offset_z as u32, scale);
+            render_into_big(
+                img,
+                &top,
+                offset_x as u32,
+                offset_z as u32,
+                scale,
+                transparency,
+            );
 
             pb.inc(1);
         }
@@ -1692,6 +1764,7 @@ fn process_region_single_ss(
     min_chunk_x: i32,
     min_chunk_z: i32,
     ss: i32,
+    transparency: bool,
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some((region_x, region_z)) = parse_region_coords(path) else {
@@ -1733,11 +1806,13 @@ fn process_region_single_ss(
             blit_supersampled(
                 img,
                 &top.blocks,
+                &top.under,
                 CHUNK_SIZE,
                 CHUNK_SIZE,
                 ss as usize,
                 offset_x,
                 offset_z,
+                transparency,
             );
 
             pb.inc(1);
@@ -1762,6 +1837,7 @@ fn process_region_single_ss(
 fn get_top_blocks(chunk: &Chunk) -> ChunkTop {
     let mut blocks: [Option<String>; COLUMNS] = std::array::from_fn(|_| None);
     let mut heights: [Option<i32>; COLUMNS] = [None; COLUMNS];
+    let mut under: [Option<String>; COLUMNS] = std::array::from_fn(|_| None);
 
     // Highest section first.
     let mut sections: Vec<&Section> = chunk.sections.iter().collect();
@@ -1850,7 +1926,102 @@ fn get_top_blocks(chunk: &Chunk) -> ChunkTop {
         }
     }
 
-    ChunkTop { blocks, heights }
+    // Second pass: for every column whose surface is water, find the first
+    // non-water, non-air block beneath it so `--transparency` can blend the
+    // water with the floor seen through it.
+    for i in 0..COLUMNS {
+        if let (Some(name), Some(h)) = (&blocks[i], heights[i]) {
+            if is_water(name) {
+                let x = i % CHUNK_SIZE;
+                let z = i / CHUNK_SIZE;
+                under[i] = find_block_under_water(chunk, x, z, h);
+            }
+        }
+    }
+
+    ChunkTop {
+        blocks,
+        heights,
+        under,
+    }
+}
+
+/// Read the name of a single block at `(local_y, x, z)` inside a section.
+///
+/// Returns `None` when the section has no block states or an empty palette.
+/// Handles both the "single palette entry, no data" fast path and the packed
+/// paletted container.
+fn read_block_at(
+    section: &Section,
+    local_y: usize,
+    x: usize,
+    z: usize,
+) -> Option<String> {
+    let block_states = section.block_states.as_ref()?;
+    if block_states.palette.is_empty() {
+        return None;
+    }
+
+    let name = if block_states.data.is_none() {
+        block_states.palette[0].name.clone()
+    } else {
+        let data = block_states.data.as_ref().unwrap();
+        let bits_per_block = bits_per_block(block_states.palette.len());
+        let entries_per_long = 64 / bits_per_block;
+        let mask = (1u64 << bits_per_block) - 1;
+
+        // Minecraft's section block index is y * 256 + z * 16 + x.
+        let index = local_y * 256 + z * 16 + x;
+        let palette_index = read_packed_index(
+            data,
+            index,
+            bits_per_block,
+            entries_per_long,
+            mask,
+        );
+        block_states.palette.get(palette_index)?.name.clone()
+    };
+
+    Some(name)
+}
+
+/// Find the first non-air, non-water block strictly below the water surface at
+/// column `(x, z)`, whose surface (top block) sits at absolute height
+/// `top_y`.
+///
+/// Sections are scanned from highest to lowest. For each section only the Y
+/// values that lie strictly below `top_y` are considered, scanned from top to
+/// bottom. The first solid block found is returned.
+fn find_block_under_water(
+    chunk: &Chunk,
+    x: usize,
+    z: usize,
+    top_y: i32,
+) -> Option<String> {
+    let mut sections: Vec<&Section> = chunk.sections.iter().collect();
+    sections.sort_unstable_by(|a, b| b.y.cmp(&a.y));
+
+    for section in &sections {
+        let section_base = section.y as i32 * 16;
+
+        // Highest local Y that is strictly below the water surface.
+        let max_local = (top_y - 1 - section_base) as i32;
+        if max_local < 0 {
+            // This whole section sits at or above the surface.
+            continue;
+        }
+        let max_local = (max_local as usize).min(15);
+
+        for local_y in (0..=max_local).rev() {
+            if let Some(name) = read_block_at(section, local_y, x, z) {
+                if !is_air(&name) && !is_water(&name) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Number of bits required by a paletted container.
@@ -1899,6 +2070,52 @@ fn is_air(name: &str) -> bool {
     )
 }
 
+/// Whether a block name is a (flowing or still) water block.
+fn is_water(name: &str) -> bool {
+    matches!(name, "minecraft:water" | "minecraft:flowing_water")
+}
+
+/// Blend a water color with the color of the block seen through it so the
+/// block is only barely visible: water is weighted by [`WATER_OVER`] and the
+/// block beneath by [`WATER_UNDER`].
+fn blend_water(water: [u8; 3], under: [u8; 3]) -> [u8; 3] {
+    let total = WATER_OVER + WATER_UNDER;
+    [
+        ((water[0] as u32 * WATER_OVER + under[0] as u32 * WATER_UNDER) / total)
+            as u8,
+        ((water[1] as u32 * WATER_OVER + under[1] as u32 * WATER_UNDER) / total)
+            as u8,
+        ((water[2] as u32 * WATER_OVER + under[2] as u32 * WATER_UNDER) / total)
+            as u8,
+    ]
+}
+
+/// Display color for a column given its surface block and (for water) the
+/// block beneath it.
+///
+/// Without transparency, or when the surface is not water, this is simply
+/// [`block_color`] of the surface block (`NO_BLOCK` for void). With
+/// transparency enabled and the surface being water, the water color is blended
+/// with the color of the block beneath so the floor is faintly visible; if
+/// there is no block beneath, plain water is used.
+fn display_color(
+    top: &Option<String>,
+    under: &Option<String>,
+    transparency: bool,
+) -> [u8; 3] {
+    match top {
+        Some(name) => {
+            if transparency && is_water(name) {
+                if let Some(un) = under {
+                    return blend_water(block_color(name), block_color(un));
+                }
+            }
+            block_color(name)
+        }
+        None => NO_BLOCK,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1934,10 +2151,11 @@ mod tests {
         let top = ChunkTop {
             blocks,
             heights: [None; COLUMNS],
+            under: std::array::from_fn(|_| None),
         };
 
         let path = std::env::temp_dir().join("worldraw_test_chunk.png");
-        render_chunk_png(&top, &path, 1).expect("render should succeed");
+        render_chunk_png(&top, &path, 1, false).expect("render should succeed");
 
         let img = image::open(&path).expect("png should be readable");
         assert_eq!(img.dimensions(), (16, 16));
@@ -1960,15 +2178,17 @@ mod tests {
                 (i == 0).then(|| "minecraft:grass_block".to_string())
             }),
             heights: [None; COLUMNS],
+            under: std::array::from_fn(|_| None),
         };
         let top_b = ChunkTop {
             blocks: std::array::from_fn(|_| Some("minecraft:sand".to_string())),
             heights: [None; COLUMNS],
+            under: std::array::from_fn(|_| None),
         };
 
         let mut img = RgbImage::new(32, 16);
-        render_into_big(&mut img, &top_a, 0, 0, 1);
-        render_into_big(&mut img, &top_b, 16, 0, 1);
+        render_into_big(&mut img, &top_a, 0, 0, 1, false);
+        render_into_big(&mut img, &top_b, 16, 0, 1, false);
 
         assert_eq!(img.dimensions(), (32, 16));
 
@@ -1996,10 +2216,11 @@ mod tests {
         let top = ChunkTop {
             blocks,
             heights: [None; COLUMNS],
+            under: std::array::from_fn(|_| None),
         };
 
         let path = std::env::temp_dir().join("worldraw_test_scaled.png");
-        render_chunk_png(&top, &path, 2).expect("render should succeed");
+        render_chunk_png(&top, &path, 2, false).expect("render should succeed");
 
         let img = image::open(&path).expect("png should be readable");
         assert_eq!(img.dimensions(), (8, 8));
@@ -2022,10 +2243,11 @@ mod tests {
                 Some("minecraft:grass_block".to_string())
             }),
             heights: [None; COLUMNS],
+            under: std::array::from_fn(|_| None),
         };
 
         let path = std::env::temp_dir().join("worldraw_test_scaled4.png");
-        render_chunk_png(&top, &path, 4).expect("render should succeed");
+        render_chunk_png(&top, &path, 4, false).expect("render should succeed");
 
         let img = image::open(&path).expect("png should be readable");
         assert_eq!(img.dimensions(), (4, 4));
@@ -2194,10 +2416,11 @@ mod tests {
                 (i == 0).then(|| "minecraft:grass_block".to_string())
             }),
             heights: [None; COLUMNS],
+            under: std::array::from_fn(|_| None),
         };
 
         let path = std::env::temp_dir().join("worldraw_test_ss.png");
-        render_chunk_png_ss(&top, &path, SUPER_SAMPLE).expect("render should succeed");
+        render_chunk_png_ss(&top, &path, SUPER_SAMPLE, false).expect("render should succeed");
 
         let img = image::open(&path).expect("png should be readable");
         assert_eq!(img.dimensions(), (16 * 5, 16 * 5));
@@ -2343,10 +2566,11 @@ mod tests {
                 (i == 0).then(|| "minecraft:grass_block".to_string())
             }),
             heights: [None; COLUMNS],
+            under: std::array::from_fn(|_| None),
         };
 
         let path = std::env::temp_dir().join("worldraw_test_hs.png");
-        render_chunk_png_ss(&top, &path, HYPER_SAMPLE).expect("render should succeed");
+        render_chunk_png_ss(&top, &path, HYPER_SAMPLE, false).expect("render should succeed");
 
         let img = image::open(&path).expect("png should be readable");
         assert_eq!(img.dimensions(), (16 * 15, 16 * 15));
@@ -2375,6 +2599,7 @@ mod tests {
             supersample,
             hypersample,
             ambient_occlusion: false,
+            transparency: false,
         };
         assert_eq!(args(false, false).upsample_factor(), None);
         assert_eq!(args(true, false).upsample_factor(), Some(SUPER_SAMPLE));
@@ -2532,9 +2757,13 @@ mod tests {
         blocks[1] = Some("minecraft:sand".to_string());
         heights[1] = Some(1);
 
-        let top = ChunkTop { blocks, heights };
+        let top = ChunkTop {
+            blocks,
+            heights,
+            under: std::array::from_fn(|_| None),
+        };
         let path = std::env::temp_dir().join("worldraw_test_ao.png");
-        render_chunk_png_ss_ao(&top, &path, 16)
+        render_chunk_png_ss_ao(&top, &path, 16, false)
             .expect("render should succeed");
 
         let img = image::open(&path).expect("png should be readable");
@@ -2553,6 +2782,97 @@ mod tests {
         assert_eq!(img.get_pixel(0, s / 2).0, lit);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn blend_water_keeps_the_floor_barely_visible() {
+        let water = [62u8, 121, 201];
+        let floor = [255u8, 255, 255];
+        let blended = blend_water(water, floor);
+
+        // It is neither pure water nor pure floor, but a true blend of the two.
+        assert_ne!(blended, water);
+        assert_ne!(blended, floor);
+        for c in 0..3 {
+            let lo = water[c].min(floor[c]) as i32;
+            let hi = water[c].max(floor[c]) as i32;
+            assert!(
+                blended[c] as i32 >= lo && blended[c] as i32 <= hi,
+                "channel {c} must stay between the two inputs"
+            );
+        }
+
+        // Water dominates, so the result sits much closer to water than floor.
+        let dist = |a: [u8; 3], b: [u8; 3]| {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| (*x as i32 - *y as i32).abs())
+                .sum::<i32>()
+        };
+        assert!(dist(blended, water) < dist(blended, floor));
+    }
+
+    #[test]
+    fn display_color_blends_water_with_the_block_beneath() {
+        let water = Some("minecraft:water".to_string());
+        let dirt = Some("minecraft:dirt".to_string());
+
+        let water_color = block_color("minecraft:water");
+        let dirt_color = block_color("minecraft:dirt");
+
+        // Non-water surface is never affected by transparency.
+        assert_eq!(
+            display_color(&dirt, &None, true),
+            dirt_color
+        );
+
+        // Water without a block beneath keeps the plain water color.
+        assert_eq!(
+            display_color(&water, &None, true),
+            water_color
+        );
+
+        // Water without transparency keeps the plain water color.
+        assert_eq!(
+            display_color(&water, &dirt, false),
+            water_color
+        );
+
+        // Water with transparency and a floor below is blended, and stays much
+        // closer to the water than to the floor.
+        let blended = display_color(&water, &dirt, true);
+        assert_ne!(blended, water_color);
+        let dist = |a: [u8; 3], b: [u8; 3]| {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| (*x as i32 - *y as i32).abs())
+                .sum::<i32>()
+        };
+        assert!(dist(blended, water_color) < dist(blended, dirt_color));
+    }
+
+    #[test]
+    fn under_water_lookup_finds_the_first_solid_block_below() {
+        // A whole-section single-palette (no data) section: section at y=4 is
+        // all water (surface), section at y=3 is all dirt (the floor).
+        let section = |y: i8, name: &str| Section {
+            y,
+            block_states: Some(BlockStates {
+                palette: vec![PaletteEntry { name: name.to_string() }],
+                data: None,
+            }),
+        };
+        let chunk = Chunk {
+            sections: vec![section(4, "minecraft:water"), section(3, "minecraft:dirt")],
+        };
+
+        let top = get_top_blocks(&chunk);
+
+        // Every column has a water surface sitting at the top of section y=4.
+        assert_eq!(top.blocks[0].as_deref(), Some("minecraft:water"));
+        assert_eq!(top.heights[0], Some(4 * 16 + 15));
+        // And the first solid block beneath it is the dirt floor.
+        assert_eq!(top.under[0].as_deref(), Some("minecraft:dirt"));
     }
 }
 
