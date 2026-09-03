@@ -1,0 +1,9 @@
+[package]
+name = "worldraw"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fastnbt = "2.6.3"
+mca = "2.1.2"
+serde = { version = "1", features = ["derive"] }
