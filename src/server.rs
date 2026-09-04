@@ -583,14 +583,25 @@ fn build_config(
             .ok_or_else(|| "scale must be a positive integer".to_string())?,
     };
 
+    // The web UI sends a single `sampling` radio (normal / supersample /
+    // hypersample), so only one sampling mode is ever active at a time. Legacy
+    // direct-POST clients that still send the old boolean `supersample` /
+    // `hypersample` fields are honored when no `sampling` value is present.
+    let (supersample, hypersample) = match get("sampling") {
+        Some("supersample") | Some("ss") => (true, false),
+        Some("hypersample") | Some("hs") => (false, true),
+        Some(_) => (false, false), // "normal" (or any other value)
+        None => (flag("supersample"), flag("hypersample")),
+    };
+
     let config = RenderConfig {
         world_path,
         dim,
         single,
         scale,
         shadows: flag("shadows"),
-        supersample: flag("supersample"),
-        hypersample: flag("hypersample"),
+        supersample,
+        hypersample,
         ambient_occlusion: flag("ao"),
         bloom: flag("bloom"),
         transparency: flag("transparency"),
@@ -623,7 +634,9 @@ fn parse_multipart(body: &[u8], content_type: Option<&str>) -> Result<Multipart,
     };
     for raw in split_multipart(body, &boundary) {
         let (headers, content) = split_headers_content(raw);
-        let name = extract_header(headers, "name").unwrap_or_default();
+        let name = extract_header(headers, "name")
+            .and_then(|n| unquote(&n))
+            .unwrap_or_default();
         let file_name = extract_header(headers, "filename").as_deref().and_then(unquote);
         if file_name.is_some() {
             multipart.parts.push(FilePart {
@@ -991,11 +1004,16 @@ fn index_html() -> String {
         </div>
       </div>
 
+      <label>Sampling</label>
+      <div class="checks">
+        <label><input type="radio" name="sampling" value="normal" checked> Normal</label>
+        <label><input type="radio" name="sampling" value="supersample"> Supersample (5&times;)</label>
+        <label><input type="radio" name="sampling" value="hypersample"> Hypersample (15&times;)</label>
+      </div>
+
       <label>Options</label>
       <div class="checks">
         <label><input type="checkbox" name="shadows" value="on"> Shadows</label>
-        <label><input type="checkbox" name="supersample" value="on"> Supersample (5&times;)</label>
-        <label><input type="checkbox" name="hypersample" value="on"> Hypersample (15&times;)</label>
         <label><input type="checkbox" name="ao" value="on"> Ambient occlusion</label>
         <label><input type="checkbox" name="bloom" value="on"> Bloom</label>
         <label><input type="checkbox" name="transparency" value="on"> Transparency</label>
@@ -1019,7 +1037,7 @@ fn index_html() -> String {
   const fill = document.getElementById('fill');
   const msg = document.getElementById('msg');
   const resultBox = document.getElementById('result');
-  const FLAGS = ['shadows', 'supersample', 'hypersample', 'ao', 'bloom', 'transparency', 'night'];
+  const FLAGS = ['shadows', 'ao', 'bloom', 'transparency', 'night'];
   let timer = null;
 
   form.addEventListener('submit', async (ev) => {
@@ -1036,6 +1054,7 @@ fn index_html() -> String {
     fd.append('dimension', form.dimension.value);
     fd.append('mode', form.mode.value);
     fd.append('scale', form.scale.value);
+    fd.append('sampling', form.sampling.value);
     for (const n of FLAGS) { const el = form[n]; if (el && el.checked) fd.append(n, 'on'); }
 
     go.disabled = true;
@@ -1096,4 +1115,96 @@ fn index_html() -> String {
 </body>
 </html>"###
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BOUNDARY: &str = "BOUNDARY123";
+
+    /// Build a realistic multipart/form-data body (CRLF, quoted `name`s) with
+    /// the given text fields followed by a single zip file part.
+    fn build_multipart(text_fields: &[(&str, &str)], file_name: &str, file_data: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, value) in text_fields {
+            body.extend_from_slice(format!(
+                "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes());
+        }
+        body.extend_from_slice(format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"world\"; filename=\"{file_name}\"\r\nContent-Type: application/zip\r\n\r\n"
+        )
+        .as_bytes());
+        body.extend_from_slice(file_data);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+        body
+    }
+
+    fn content_type() -> String {
+        format!("multipart/form-data; boundary={BOUNDARY}")
+    }
+
+    fn config_for(text_fields: &[(&str, &str)]) -> RenderConfig {
+        let body = build_multipart(text_fields, "world.zip", b"PK\x03\x04zipdata");
+        let parsed = parse_multipart(&body, Some(&content_type())).expect("multipart should parse");
+        build_config(&parsed.fields, PathBuf::from("world"), PathBuf::from("out")).expect("config")
+    }
+
+    #[test]
+    fn multipart_field_names_are_unquoted() {
+        let body = build_multipart(&[("sampling", "supersample")], "world.zip", b"PKzipdata");
+        let parsed = parse_multipart(&body, Some(&content_type())).expect("parse");
+        assert_eq!(
+            parsed.fields.get("sampling").map(String::as_str),
+            Some("supersample")
+        );
+        // The regression that made every UI option a no-op: the name was
+        // stored WITH its surrounding quotes, so no lookup ever matched.
+        assert!(
+            !parsed.fields.contains_key("\"sampling\""),
+            "field name must not retain its quotes"
+        );
+    }
+
+    #[test]
+    fn sampling_radio_selects_supersample() {
+        let config = config_for(&[("sampling", "supersample")]);
+        assert!(config.supersample, "radio should enable supersampling");
+        assert!(!config.hypersample);
+    }
+
+    #[test]
+    fn sampling_radio_selects_hypersample() {
+        let config = config_for(&[("sampling", "hypersample")]);
+        assert!(config.hypersample, "radio should enable hypersampling");
+        assert!(!config.supersample);
+    }
+
+    #[test]
+    fn sampling_normal_disables_sampling_even_if_legacy_flag_present() {
+        let config = config_for(&[("sampling", "normal"), ("supersample", "on")]);
+        assert!(!config.supersample && !config.hypersample);
+    }
+
+    #[test]
+    fn legacy_boolean_flags_still_work_when_no_sampling_is_sent() {
+        let config = config_for(&[("supersample", "on")]);
+        assert!(config.supersample && !config.hypersample);
+    }
+
+    #[test]
+    fn other_options_are_parsed_from_unquoted_names() {
+        let config = config_for(&[
+            ("dimension", "nether"),
+            ("mode", "chunks"),
+            ("scale", "2"),
+            ("night", "on"),
+        ]);
+        assert_eq!(config.dim, 1);
+        assert!(!config.single);
+        assert_eq!(config.scale, 2);
+        assert!(config.night);
+    }
 }
