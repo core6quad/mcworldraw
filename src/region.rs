@@ -9,6 +9,7 @@
 //! `process_region_single_ss` blit chunks into the in-memory output image.
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use fastnbt::from_bytes;
@@ -194,6 +195,69 @@ pub(crate) fn parse_region_coords(path: &Path) -> Option<(i32, i32)> {
     let z: i32 = parts[2].parse().ok()?;
 
     Some((x, z))
+}
+
+/// Fast chunk count + bounding box for a region file, reading only the 4 KiB
+/// chunk index (the file's first 4096 bytes) rather than decompressing any
+/// chunk. This is what pre-render size estimates use: counting how many chunks
+/// a world holds and where they sit is all the index needs.
+///
+/// Returns `(count, bounds)`, the same shape as [`scan_region`]; `bounds` is
+/// `None` when the file has no occupied slots (or is unreadable/malformed).
+pub(crate) fn count_region_index(path: &Path) -> (usize, Option<Bounds>) {
+    let Some((region_x, region_z)) = parse_region_coords(path) else {
+        return (0, None);
+    };
+
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (0, None),
+    };
+    let mut index = [0u8; 4096];
+    if file.read_exact(&mut index).is_err() {
+        return (0, None);
+    }
+
+    let mut count = 0usize;
+    let mut min_x = i32::MAX;
+    let mut min_z = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_z = i32::MIN;
+
+    for entry in 0..1024usize {
+        // Each 4-byte slot is a 3-byte big-endian offset (in 4 KiB sectors)
+        // followed by a 1-byte size. A slot is occupied when its offset != 0.
+        let base = entry * 4;
+        let offset = ((index[base] as u32) << 16)
+            | ((index[base + 1] as u32) << 8)
+            | index[base + 2] as u32;
+        if offset == 0 {
+            continue;
+        }
+
+        let local_x = (entry % 32) as i32;
+        let local_z = (entry / 32) as i32;
+        let chunk_x = region_x * 32 + local_x;
+        let chunk_z = region_z * 32 + local_z;
+
+        count += 1;
+        min_x = min_x.min(chunk_x);
+        max_x = max_x.max(chunk_x);
+        min_z = min_z.min(chunk_z);
+        max_z = max_z.max(chunk_z);
+    }
+
+    let bounds = if count > 0 {
+        Some(Bounds {
+            min_x,
+            min_z,
+            max_x,
+            max_z,
+        })
+    } else {
+        None
+    };
+    (count, bounds)
 }
 
 /// Fill the shared `heights` / `colors` / `lights` grids (in block units,
@@ -454,5 +518,41 @@ mod tests {
         assert_eq!(merged.min_z, 0);
         assert_eq!(merged.max_x, 2);
         assert_eq!(merged.max_z, 5);
+    }
+
+    /// Write a minimal `r.x.z.mca`-named file whose 4 KiB index has the given
+    /// occupied slots (used to test [`count_region_index`]).
+    fn write_index_mca(path: &Path, slots: &[(usize, u32)]) {
+        let mut index = [0u8; 4096];
+        for (entry, offset) in slots {
+            let b = entry * 4;
+            index[b] = (offset >> 16) as u8;
+            index[b + 1] = (offset >> 8) as u8;
+            index[b + 2] = (*offset & 0xff) as u8;
+            index[b + 3] = 1; // one 4 KiB sector
+        }
+        fs::write(path, index).unwrap();
+    }
+
+    #[test]
+    fn count_region_index_counts_occupied_slots_and_bounds() {
+        let dir = std::env::temp_dir().join(format!("worldraw-ci-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        // Region (1,2): chunk x in [32..63], chunk z in [64..95].
+        let path = dir.join("r.1.2.mca");
+        // entry 0 = local (0,0) -> chunk (32,64); entry 63 = local (31,1) -> chunk (63,65)
+        write_index_mca(&path, &[(0, 2), (63, 3)]);
+        let (count, bounds) = count_region_index(&path);
+        assert_eq!(count, 2);
+        let b = bounds.expect("occupied slots should yield bounds");
+        assert_eq!((b.min_x, b.min_z, b.max_x, b.max_z), (32, 64, 63, 65));
+
+        // An all-empty index reports zero chunks and no bounds.
+        write_index_mca(&path, &[]);
+        let (count, bounds) = count_region_index(&path);
+        assert_eq!(count, 0);
+        assert!(bounds.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

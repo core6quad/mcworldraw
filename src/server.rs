@@ -19,7 +19,7 @@ use indicatif::ProgressBar;
 use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCode};
 use zip::{ZipArchive, ZipWriter};
 
-use crate::pipeline::{run_render, validate_config, RenderConfig};
+use crate::pipeline::{run_render, scan_dimension_stats, validate_config, RenderConfig};
 
 /// Port the dedicated server listens on.
 const PORT: u16 = 7878;
@@ -31,6 +31,9 @@ const MAX_ARCHIVE_ENTRIES: usize = 200_000;
 const MAX_EXTRACTED_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 /// How long a finished job (and its temporary output) is kept for download.
 const JOB_RETENTION: Duration = Duration::from_secs(30 * 60);
+/// How long an uploaded-but-unrendered world ("ready" job) is kept before its
+/// temporary workspace is dropped.
+const READY_RETENTION: Duration = Duration::from_secs(15 * 60);
 
 /// The rendered artifact of a job, ready to be downloaded.
 #[derive(Clone)]
@@ -47,7 +50,7 @@ struct JobOutput {
 /// reads it) and the background render thread (which writes it).
 struct Job {
     id: String,
-    /// "pending" | "working" | "done" | "error".
+    /// "ready" | "pending" | "working" | "done" | "error".
     status: Mutex<String>,
     /// Human-readable stage message.
     message: Mutex<String>,
@@ -57,8 +60,13 @@ struct Job {
     output: Mutex<Option<JobOutput>>,
     /// When the job finished (used to decide when it can be reaped).
     finished: Option<Instant>,
+    /// When the job was created (used to reap worlds that were uploaded but
+    /// never rendered).
+    created: Instant,
     /// The temporary workspace; removed when the job is reaped.
     workspace: Option<PathBuf>,
+    /// The prepared world root (set after upload), used by `/render`.
+    world_dir: Option<PathBuf>,
     /// A progress-bar clone sharing state with the render thread's bar, so the
     /// server can read live position/length.
     progress: ProgressBar,
@@ -111,19 +119,23 @@ impl JobRegistry {
         guard.get(id).and_then(|job| job.output.lock().unwrap().clone())
     }
 
-    /// Remove finished jobs whose output has been kept long enough.
+    /// Remove finished jobs whose output has been kept long enough, and
+    /// uploaded-but-unrendered jobs that have sat idle too long.
     fn reap_finished(&self, retention: Duration) {
         let mut guard = self.jobs.lock().unwrap();
+        let now = Instant::now();
         let stale: Vec<String> = guard
             .iter()
             .filter(|(_, job)| {
                 let st = job.status.lock().unwrap();
-                let done = st.as_str() == "done" || st.as_str() == "error";
-                done
-                    && job
+                match st.as_str() {
+                    "done" | "error" => job
                         .finished
                         .map(|t| t.elapsed() > retention)
-                        .unwrap_or(false)
+                        .unwrap_or(false),
+                    "ready" => now.duration_since(job.created) > READY_RETENTION,
+                    _ => false,
+                }
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -179,6 +191,7 @@ fn handle_request(registry: &Arc<JobRegistry>, mut request: Request) {
         ),
         (Method::Get, "/health") => (json_body(r#"{"status":"ok"}"#, StatusCode(200)), false),
         (Method::Post, "/upload") => (upload_response(registry, &mut request), false),
+        (Method::Post, "/render") => (render_response(registry, &query), false),
         (Method::Get, "/progress") => (progress_response(registry, &query), false),
         (Method::Get, "/result") => (result_response(registry, &query), true),
         _ => (
@@ -381,6 +394,20 @@ fn query_value(query: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Parse a whole `key=value&key=value` query string into a URL-decoded map.
+/// Used by `/render`, which sends the render config as query parameters.
+fn parse_query_fields(query: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            let key = url_decode(k).unwrap_or_else(|| k.to_string());
+            let value = url_decode(v).unwrap_or_else(|| v.to_string());
+            map.insert(key, value);
+        }
+    }
+    map
+}
+
 fn url_decode(input: &str) -> Option<String> {
     let bytes: Vec<u8> = input.bytes().collect();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -415,57 +442,79 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Spin up a background render for an uploaded world and return its job id.
-fn spawn_job(registry: &Arc<JobRegistry>, config: RenderConfig, workspace: PathBuf) -> String {
+/// Run the render for an existing job in a background thread, updating that
+/// job's progress bar and status as it goes. The thread is detached; it keeps
+/// running until the render finishes or fails.
+fn render_thread(registry: Arc<JobRegistry>, id: String, pb: ProgressBar, config: RenderConfig) {
+    registry.with_job(&id, |job| job.set_status("working", "rendering…"));
+    let result = run_render(&config, &pb);
+    pb.finish();
+    match result {
+        Ok(r) => {
+            let output = JobOutput {
+                single: r
+                    .single_image
+                    .as_ref()
+                    .map(|p| (p.clone(), r.width, r.height)),
+                chunk_dir: r.chunk_dir.clone(),
+                file_name: r.out_file_name.to_string(),
+            };
+            registry.with_job(&id, |job| {
+                job.output.lock().unwrap().replace(output);
+                job.finished = Some(Instant::now());
+                job.set_status("done", "complete");
+            });
+        }
+        Err(e) => {
+            registry.with_job(&id, |job| {
+                job.error.lock().unwrap().replace(e);
+                job.finished = Some(Instant::now());
+                job.set_status("error", "failed");
+            });
+        }
+    }
+}
+
+/// Create an in-memory job for an already-prepared world, in the "ready" state
+/// (world on disk, awaiting a `/render` request). No render thread is started.
+fn create_ready_job(
+    registry: &Arc<JobRegistry>,
+    workspace: PathBuf,
+    world_dir: PathBuf,
+) -> String {
     let id = registry.create_id();
-    let pb = ProgressBar::new(0);
     let job = Job {
         id: id.clone(),
-        status: Mutex::new("pending".to_string()),
-        message: Mutex::new("waiting to start".to_string()),
+        status: Mutex::new("ready".to_string()),
+        message: Mutex::new("world ready".to_string()),
         error: Mutex::new(None),
         output: Mutex::new(None),
         finished: None,
+        created: Instant::now(),
         workspace: Some(workspace),
-        progress: pb.clone(),
+        world_dir: Some(world_dir),
+        progress: ProgressBar::new(0),
     };
     registry.insert(job);
+    id
+}
 
-    let registry_bg = Arc::clone(&registry);
-    let id_bg = id.clone();
+/// Start the background render for a "ready" job. Returns `false` when the job
+/// is unknown (or already gone), so the caller can report an error.
+fn start_render(registry: &Arc<JobRegistry>, id: &str, config: RenderConfig) -> bool {
+    let pb = {
+        let guard = registry.jobs.lock().unwrap();
+        guard.get(id).map(|job| job.progress.clone())
+    };
+    let Some(pb) = pb else {
+        return false;
+    };
+    let registry_bg = Arc::clone(registry);
+    let id_bg = id.to_string();
     std::thread::Builder::new()
         .name(format!("render-{id}"))
-        .spawn(move || {
-            registry_bg.with_job(&id_bg, |job| job.set_status("working", "rendering…"));
-            let result = run_render(&config, &pb);
-            pb.finish();
-            match result {
-                Ok(r) => {
-                    let output = JobOutput {
-                        single: r
-                            .single_image
-                            .as_ref()
-                            .map(|p| (p.clone(), r.width, r.height)),
-                        chunk_dir: r.chunk_dir.clone(),
-                        file_name: r.out_file_name.to_string(),
-                    };
-                    registry_bg.with_job(&id_bg, |job| {
-                        job.output.lock().unwrap().replace(output);
-                        job.finished = Some(Instant::now());
-                        job.set_status("done", "complete");
-                    });
-                }
-                Err(e) => {
-                    registry_bg.with_job(&id_bg, |job| {
-                        job.error.lock().unwrap().replace(e);
-                        job.finished = Some(Instant::now());
-                        job.set_status("error", "failed");
-                    });
-                }
-            }
-        })
-        .ok();
-    id
+        .spawn(move || render_thread(registry_bg, id_bg, pb, config))
+        .is_ok()
 }
 
 /// `POST /upload` — parse the multipart form, prepare the world, start a job.
@@ -494,7 +543,7 @@ fn upload_response(registry: &Arc<JobRegistry>, request: &mut Request) -> Respon
         Ok(parsed) => parsed,
         Err(msg) => return json_error(StatusCode(400), &msg),
     };
-    let Multipart { fields, parts } = parsed;
+    let Multipart { fields: _, parts } = parsed;
 
     let workspace =
         PathBuf::from(std::env::temp_dir()).join(format!("worldraw-{}", registry.create_id()));
@@ -530,21 +579,67 @@ fn upload_response(registry: &Arc<JobRegistry>, request: &mut Request) -> Respon
         );
     }
 
-    let config = match build_config(&fields, world_dir.clone(), output_dir) {
-        Ok(config) => config,
-        Err(msg) => {
-            let _ = fs::remove_dir_all(&workspace);
-            return json_error(StatusCode(400), &msg);
+    // Measure the world (fast, index-only) for every dimension so the browser
+    // can preview any of them — and switch dimension — without re-uploading.
+    let dims = [("overworld", 0i32), ("nether", 1i32), ("the_end", -1i32)];
+    let mut dims_json = String::new();
+    for (i, (name, id)) in dims.iter().enumerate() {
+        let s = scan_dimension_stats(&world_dir, *id);
+        if i > 0 {
+            dims_json.push(',');
         }
-    };
+        dims_json.push_str(&format!(
+            r#"{}:{{"chunks":{},"blocks_w":{},"blocks_h":{},"region_files":{}}}"#,
+            json_string(name),
+            s.chunks,
+            s.blocks_w,
+            s.blocks_h,
+            s.region_files,
+        ));
+    }
 
-    let id = spawn_job(registry, config, workspace);
+    // The world is prepared and measured; hold it in a "ready" job. The actual
+    // render is a separate `POST /render` so the user can review the size
+    // estimate (and tweak settings) before committing to it.
+    let id = create_ready_job(registry, workspace, world_dir.clone());
     let body = format!(
-        r#"{{"job": {}, "world": {}}}"#,
+        r#"{{"job":{},"world":{},"dimensions":{{{dims_json}}}}}"#,
         json_string(&id),
         json_string(&world_dir.display().to_string()),
     );
     json_body(&body, StatusCode(201))
+}
+
+/// `POST /render?job=ID&<config>` — start a render for an uploaded ("ready")
+/// job. The config travels as query parameters so the existing `build_config`
+/// (and its validation) is reused for the request.
+fn render_response(registry: &Arc<JobRegistry>, query: &str) -> ResponseBox {
+    let id = query_value(query, "job").unwrap_or_default();
+    let fields = parse_query_fields(query);
+
+    let (world_dir, output_dir) = {
+        let guard = registry.jobs.lock().unwrap();
+        match guard.get(&id) {
+            Some(job) => match (job.world_dir.clone(), job.workspace.clone()) {
+                (Some(wd), Some(ws)) => (Some(wd), Some(ws.join("out"))),
+                _ => (None, None),
+            },
+            None => (None, None),
+        }
+    };
+    let (Some(world_dir), Some(output_dir)) = (world_dir, output_dir) else {
+        return json_error(StatusCode(404), "unknown job (is the world still uploaded?)");
+    };
+
+    let config = match build_config(&fields, world_dir, output_dir) {
+        Ok(config) => config,
+        Err(msg) => return json_error(StatusCode(400), &msg),
+    };
+
+    if !start_render(registry, &id, config) {
+        return json_error(StatusCode(404), "unknown job (is the world still uploaded?)");
+    }
+    json_body(&format!(r#"{{"job":{}}}"#, json_string(&id)), StatusCode(200))
 }
 
 /// Turn the multipart form fields into a `RenderConfig`, mirroring the CLI's
@@ -956,6 +1051,12 @@ fn index_html() -> String {
   .card.dropzone { transition: border-color .15s, background .15s; }
   .card.dropzone.dragover { border-color: #4f8cff; background: #262f45; }
   .dropzone-hint { color: #6f7686; font-size: 12px; margin: 0 0 10px; }
+  #stats { display: none; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 22px; margin-top: 4px; }
+  .stats .item { display: flex; justify-content: space-between; gap: 10px; font-size: 14px; }
+  .stats .item .k { color: #9aa0ad; }
+  .stats .item .v { color: #e6e8ee; font-weight: 600; text-align: right; }
+  .estimate-note { color: #6f7686; font-size: 12px; margin: 12px 0 0; }
   #status { display: none; }
   .bar { height: 10px; background: #15171d; border-radius: 6px; overflow: hidden; margin: 4px 0 8px; }
   .bar > div { height: 100%; width: 0; background: linear-gradient(90deg, #4f8cff, #6ad4ff); transition: width .2s; }
@@ -1027,6 +1128,12 @@ fn index_html() -> String {
       </div>
     </div>
 
+    <div class="card" id="stats">
+      <label>World size estimate</label>
+      <div class="stats" id="statsBody"></div>
+      <p class="estimate-note" id="estimateNote"></p>
+    </div>
+
     <button id="go" type="submit">Render world</button>
   </form>
 
@@ -1043,8 +1150,14 @@ fn index_html() -> String {
   const fill = document.getElementById('fill');
   const msg = document.getElementById('msg');
   const resultBox = document.getElementById('result');
+  const statsBox = document.getElementById('stats');
+  const statsBody = document.getElementById('statsBody');
+  const estimateNote = document.getElementById('estimateNote');
   const FLAGS = ['shadows', 'ao', 'bloom', 'transparency', 'night'];
   let timer = null;
+  let uploading = false;
+  let currentJob = null; // id of the uploaded ("ready") job
+  let worldDims = null; // per-dimension stats from /upload
 
   const samplingRadios = form.querySelectorAll('input[name="sampling"]');
 
@@ -1072,8 +1185,13 @@ fn index_html() -> String {
     form.shadows.disabled = !isSingle;
     if (!isSingle) form.shadows.checked = false;
   }
-  samplingRadios.forEach(r => r.addEventListener('change', applyConstraints));
-  form.mode.addEventListener('change', applyConstraints);
+  function onOptionsChange() { applyConstraints(); updateStats(); }
+  samplingRadios.forEach(r => r.addEventListener('change', onOptionsChange));
+  form.mode.addEventListener('change', onOptionsChange);
+  form.dimension.addEventListener('change', updateStats);
+  form.scale.addEventListener('input', updateStats);
+  form.scale.addEventListener('change', updateStats);
+  go.disabled = true; // enable once a world has been uploaded
   applyConstraints();
 
   // --- Drag & drop onto the upload card: accepts a world folder or a .zip ---
@@ -1110,9 +1228,16 @@ fn index_html() -> String {
   }
   function setNote(text) { if (dropNote) dropNote.textContent = text; }
 
-  // Picking via a button clears any drop, and vice-versa (handled in handleDrop).
-  folderInput.addEventListener('change', () => { dropped = null; });
-  zipInput.addEventListener('change', () => { dropped = null; });
+  // Selecting via a button uploads immediately (same as a drop), so the size
+  // estimate shows up as soon as the world has been measured.
+  folderInput.addEventListener('change', () => {
+    dropped = null;
+    if (folderInput.files.length) { setInputFiles(zipInput, []); uploadWorld(folderInput.files); }
+  });
+  zipInput.addEventListener('change', () => {
+    dropped = null;
+    if (zipInput.files.length) { setInputFiles(folderInput, []); uploadWorld(zipInput.files); }
+  });
 
   async function handleDrop(e) {
     let folderEntry = null, zipFile = null;
@@ -1133,12 +1258,14 @@ fn index_html() -> String {
       dropped = { files };
       setInputFiles(folderInput, files);
       setInputFiles(zipInput, []);
-      setNote('Folder loaded: ' + files.length + ' file(s). Ready to render.');
+      setNote('Folder loaded — uploading…');
+      uploadWorld(files);
     } else if (zipFile) {
       dropped = { files: [zipFile] };
       setInputFiles(zipInput, [zipFile]);
       setInputFiles(folderInput, []);
-      setNote('Archive loaded: ' + zipFile.name + '. Ready to render.');
+      setNote('Archive loaded — uploading…');
+      uploadWorld([zipFile]);
     } else {
       setNote('Drop a world folder or a .zip archive.');
     }
@@ -1157,36 +1284,123 @@ fn index_html() -> String {
     handleDrop(e);
   });
 
+  // --- Upload (phase 1): send the world, get back its per-dimension size stats. ---
+  async function uploadWorld(files) {
+    if (!files || files.length === 0) return;
+    if (uploading) return;
+    uploading = true;
+    if (timer) { clearInterval(timer); timer = null; }
+    currentJob = null;
+    worldDims = null;
+    go.disabled = true;
+    resultBox.innerHTML = '';
+    statsBox.style.display = 'none';
+    statusBox.style.display = 'block';
+    fill.style.width = '0%';
+    msg.className = 'msg';
+    msg.textContent = 'Uploading and measuring world…';
+
+    const fd = new FormData();
+    for (const f of files) fd.append('world', f, f.__relpath || f.webkitRelativePath || f.name);
+    try {
+      const res = await fetch('/upload', { method: 'POST', body: fd });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || 'upload failed');
+      currentJob = json.job;
+      worldDims = json.dimensions;
+      msg.className = 'msg done';
+      msg.textContent = 'World ready — review the estimate, then render.';
+      updateStats();
+      go.disabled = false;
+    } catch (e) {
+      showErr(e.message);
+    } finally {
+      uploading = false;
+    }
+  }
+
+  // --- Live size estimate, computed client-side from the uploaded stats. ---
+  function fmtInt(n) { return n.toLocaleString('en-US'); }
+  function fmtBytes(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+    return (n / 1073741824).toFixed(2) + ' GB';
+  }
+  function upsampleFactor() {
+    const s = currentSampling();
+    return s === 'hypersample' ? 15 : s === 'supersample' ? 5 : 1;
+  }
+  function statItem(k, v) {
+    return '<div class="item"><span class="k">' + k + '</span><span class="v">' + v + '</span></div>';
+  }
+  function updateStats() {
+    if (!worldDims) { statsBox.style.display = 'none'; return; }
+    const d = worldDims[form.dimension.value];
+    if (!d || d.chunks === 0) {
+      statsBox.style.display = 'block';
+      statsBody.innerHTML = statItem('Chunks', '0');
+      estimateNote.textContent = 'No region data found for this dimension.';
+      return;
+    }
+    const ss = upsampleFactor();
+    const scale = Math.max(1, parseInt(form.scale.value, 10) || 1);
+    const single = form.mode.value === 'single';
+    const items = [
+      statItem('Chunks', fmtInt(d.chunks)),
+      statItem('Region files', fmtInt(d.region_files)),
+      statItem('World span', fmtInt(d.blocks_w) + ' \u00d7 ' + fmtInt(d.blocks_h) + ' blocks'),
+    ];
+    let pixels = 0;
+    let note;
+    if (single) {
+      const w = ss > 1 ? d.blocks_w * ss : Math.ceil(d.blocks_w / scale);
+      const h = ss > 1 ? d.blocks_h * ss : Math.ceil(d.blocks_h / scale);
+      pixels = w * h;
+      items.push(statItem('Image size', fmtInt(w) + ' \u00d7 ' + fmtInt(h) + ' px'));
+      items.push(statItem('Pixels', fmtInt(pixels)));
+      note = 'One PNG. Size is a rough estimate (~1 byte/pixel after PNG compression); detailed maps can be larger.';
+    } else {
+      const cpx = ss > 1 ? 16 * ss : Math.ceil(16 / scale);
+      pixels = d.chunks * cpx * cpx;
+      items.push(statItem('Chunk PNGs', fmtInt(d.chunks) + ' files'));
+      items.push(statItem('Each', cpx + ' \u00d7 ' + cpx + ' px'));
+      items.push(statItem('Pixels (total)', fmtInt(pixels)));
+      note = 'One PNG per chunk, sent as a zip. Size is a rough estimate (~1 byte/pixel after compression).';
+    }
+    items.push(statItem('Estimated size', '\u2248 ' + fmtBytes(pixels)));
+    statsBody.innerHTML = items.join('');
+    estimateNote.textContent = note;
+    statsBox.style.display = 'block';
+  }
+
+  // --- Render (phase 2): start the render for the uploaded job. ---
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
-    const folder = document.getElementById('folder');
-    const zip = document.getElementById('zip');
-    const files = dropped ? dropped.files : (folder.files.length ? folder.files : zip.files);
-    if (!files || files.length === 0) {
+    if (!currentJob) {
       alert('Please choose a world folder or a .zip archive first.');
       return;
     }
-    const fd = new FormData();
-    for (const f of files) fd.append('world', f, f.__relpath || f.webkitRelativePath || f.name);
-    fd.append('dimension', form.dimension.value);
-    fd.append('mode', form.mode.value);
-    fd.append('scale', form.scale.value);
-    fd.append('sampling', form.sampling.value);
-    for (const n of FLAGS) { const el = form[n]; if (el && el.checked) fd.append(n, 'on'); }
+    const params = new URLSearchParams();
+    params.append('job', currentJob);
+    params.append('dimension', form.dimension.value);
+    params.append('mode', form.mode.value);
+    params.append('scale', form.scale.value);
+    params.append('sampling', currentSampling());
+    for (const n of FLAGS) { const el = form[n]; if (el && el.checked) params.append(n, 'on'); }
 
     go.disabled = true;
     msg.className = 'msg';
-    msg.textContent = 'Uploading…';
+    msg.textContent = 'Rendering…';
     resultBox.innerHTML = '';
     fill.style.width = '0%';
     statusBox.style.display = 'block';
 
     try {
-      const res = await fetch('/upload', { method: 'POST', body: fd });
+      const res = await fetch('/render?' + params.toString(), { method: 'POST' });
       const json = await res.json();
-      if (!res.ok) throw new Error(json.error || 'upload failed');
-      msg.textContent = 'Job started — rendering…';
-      poll(json.job);
+      if (!res.ok) throw new Error(json.error || 'failed to start render');
+      poll(json.job || currentJob);
     } catch (e) {
       showErr(e.message);
     }

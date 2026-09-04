@@ -8,7 +8,7 @@
 //! server mirrors the same numbers to the browser over HTTP.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use image::RgbImage;
 use indicatif::ProgressBar;
@@ -22,8 +22,8 @@ use crate::light::{
     NIGHT_BLOOM_RADIUS_BLOCKS,
 };
 use crate::region::{
-    collect_grid, process_region, process_region_single, process_region_single_ss, scan_region,
-    Bounds,
+    collect_grid, count_region_index, process_region, process_region_single,
+    process_region_single_ss, scan_region, Bounds,
 };
 use crate::render::{render_shaded_map, render_ss};
 
@@ -108,6 +108,83 @@ impl RenderResult {
             chunk_dir: None,
             out_file_name,
         }
+    }
+}
+
+/// Per-dimension statistics about a world's region data, used to preview how
+/// large a render will be *before* it runs (see [`scan_dimension_stats`]).
+pub(crate) struct DimStats {
+    /// Number of non-empty chunks in this dimension.
+    pub chunks: usize,
+    /// Width of the chunk bounding box, in blocks.
+    pub blocks_w: u64,
+    /// Depth (z) of the chunk bounding box, in blocks.
+    pub blocks_h: u64,
+    /// Number of `.mca` region files on disk for this dimension.
+    pub region_files: usize,
+}
+
+impl DimStats {
+    fn empty() -> Self {
+        DimStats {
+            chunks: 0,
+            blocks_w: 0,
+            blocks_h: 0,
+            region_files: 0,
+        }
+    }
+}
+
+/// Scan one dimension's region files (index only — no chunk decompression) and
+/// report how many non-empty chunks it holds and the size of their bounding box
+/// in blocks. Mirrors the first pass of [`run_render`] but is cheap enough to
+/// run for every dimension right after an upload.
+pub(crate) fn scan_dimension_stats(world_path: &Path, dim: i32) -> DimStats {
+    let Ok(info) = dimension_info(dim) else {
+        return DimStats::empty();
+    };
+    let Some(region_path) = dimension_region_path(world_path, &info) else {
+        return DimStats::empty();
+    };
+
+    let mut region_files: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&region_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "mca") {
+                region_files.push(path);
+            }
+        }
+    }
+    region_files.sort();
+
+    let mut total_chunks = 0usize;
+    let mut world_bounds: Option<Bounds> = None;
+    for path in &region_files {
+        let (count, bounds) = count_region_index(path);
+        total_chunks += count;
+        if let Some(b) = bounds {
+            world_bounds = Some(match world_bounds {
+                Some(prev) => prev.merged(&b),
+                None => b,
+            });
+        }
+    }
+
+    let (blocks_w, blocks_h) = match world_bounds {
+        Some(b) => {
+            let w = ((b.max_x - b.min_x + 1) as i64 * CHUNK_SIZE as i64).max(0) as u64;
+            let h = ((b.max_z - b.min_z + 1) as i64 * CHUNK_SIZE as i64).max(0) as u64;
+            (w, h)
+        }
+        None => (0, 0),
+    };
+
+    DimStats {
+        chunks: total_chunks,
+        blocks_w,
+        blocks_h,
+        region_files: region_files.len(),
     }
 }
 
@@ -364,4 +441,44 @@ pub(crate) fn run_render(config: &RenderConfig, pb: &ProgressBar) -> Result<Rend
         chunk_dir: Some(config.output_dir.clone()),
         out_file_name: dim.out_file,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_index_mca(path: &Path, slots: &[(usize, u32)]) {
+        let mut index = [0u8; 4096];
+        for (entry, offset) in slots {
+            let b = entry * 4;
+            index[b] = (offset >> 16) as u8;
+            index[b + 1] = (offset >> 8) as u8;
+            index[b + 2] = (*offset & 0xff) as u8;
+            index[b + 3] = 1;
+        }
+        fs::write(path, index).unwrap();
+    }
+
+    #[test]
+    fn scan_dimension_stats_reports_chunks_and_block_span() {
+        let dir = std::env::temp_dir().join(format!("worldraw-ci-scan-{}", std::process::id()));
+        let region_dir = dir.join("region");
+        let _ = fs::create_dir_all(&region_dir);
+        // Region (1,2): occupied chunks at (32,64) and (63,65).
+        write_index_mca(&region_dir.join("r.1.2.mca"), &[(0, 2), (63, 3)]);
+
+        let s = scan_dimension_stats(&dir, 0);
+        assert_eq!(s.chunks, 2);
+        assert_eq!(s.region_files, 1);
+        // Chunks span x in [32..63] (32 chunks) and z in [64..65] (2 chunks).
+        assert_eq!(s.blocks_w, 32 * CHUNK_SIZE as u64);
+        assert_eq!(s.blocks_h, 2 * CHUNK_SIZE as u64);
+
+        // A dimension with no matching region folder is empty.
+        let empty = scan_dimension_stats(&dir, -1);
+        assert_eq!(empty.chunks, 0);
+        assert_eq!(empty.region_files, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
