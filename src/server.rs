@@ -1027,47 +1027,179 @@ fn index_html() -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>worldraw — Minecraft world renderer</title>
 <style>
-  :root { color-scheme: dark; }
+  /* ── Theme variables ─────────────────────────────────────────────── */
+  :root, [data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0a0e0a;
+    --bg-card: #111a11;
+    --bg-input: #0d150d;
+    --bg-bar: #090d09;
+    --border: #1a3a1a;
+    --border-hover: #2a5a2a;
+    --text: #d4e8d4;
+    --text-muted: #6a8a6a;
+    --text-hint: #4a6a4a;
+    --accent: #00cc44;
+    --accent-hover: #00e850;
+    --accent-disabled: #1a3a1a;
+    --accent-text: #003311;
+    --bar-fill: linear-gradient(90deg, #00cc44, #44ff88);
+    --result-bg: #00aa33;
+    --err: #ff5555;
+    --done: #44ff88;
+    --dragover-bg: #162216;
+  }
+  [data-theme="light"] {
+    color-scheme: light;
+    --bg: #fefefe;
+    --bg-card: #ffffff;
+    --bg-input: #fafafa;
+    --bg-bar: #f0f0f0;
+    --border: #e0c0c0;
+    --border-hover: #cc6666;
+    --text: #1a1a1a;
+    --text-muted: #7a5a5a;
+    --text-hint: #9a7a7a;
+    --accent: #cc2200;
+    --accent-hover: #e83000;
+    --accent-disabled: #e0c0c0;
+    --accent-text: #ffffff;
+    --bar-fill: linear-gradient(90deg, #cc2200, #ff5533);
+    --result-bg: #aa1100;
+    --err: #cc0000;
+    --done: #008844;
+    --dragover-bg: #fff0f0;
+  }
   * { box-sizing: border-box; }
-  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; background: #1b1d24; color: #e6e8ee; }
-  .wrap { max-width: 720px; margin: 0 auto; padding: 40px 20px 80px; }
-  h1 { font-size: 26px; margin: 0 0 4px; }
-  p.sub { color: #9aa0ad; margin: 0 0 28px; }
-  .card { background: #242732; border: 1px solid #323645; border-radius: 12px; padding: 20px 22px; margin-bottom: 18px; }
-  label { display: block; font-size: 13px; color: #aab0bd; margin: 14px 0 6px; }
-  input[type="text"], input[type="number"], select { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #3a3f4f; background: #1b1d24; color: #e6e8ee; font-size: 14px; }
-  .row { display: flex; flex-wrap: wrap; gap: 14px 22px; }
-  .row > div { flex: 1 1 180px; }
-  .checks { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 18px; margin-top: 8px; }
-  .checks label { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 14px; color: #d6dae3; }
-  .checks input { width: auto; }
-  button { margin-top: 22px; width: 100%; padding: 13px; border: 0; border-radius: 10px; background: #4f8cff; color: #fff; font-size: 16px; font-weight: 600; cursor: pointer; }
-  button:disabled { background: #3a4152; color: #8b90a0; cursor: not-allowed; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    transition: background .25s, color .25s;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 32px 16px 80px; }
+  h1 { font-size: 24px; margin: 0 0 4px; font-weight: 700; letter-spacing: -0.5px; }
+  p.sub { color: var(--text-muted); margin: 0 0 24px; font-size: 14px; }
+  #themeToggle {
+    position: fixed;
+    top: 14px; right: 14px; z-index: 999;
+    width: 42px; height: 42px;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    background: var(--bg-card);
+    color: var(--accent);
+    font-size: 20px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: background .2s, border-color .2s, transform .1s;
+    line-height: 1;
+  }
+  #themeToggle:hover { border-color: var(--border-hover); background: var(--dragover-bg); }
+  #themeToggle:active { transform: scale(0.95); }
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 18px 18px;
+    margin-bottom: 14px;
+    transition: background .25s, border-color .25s;
+  }
+  label { display: block; font-size: 13px; color: var(--text-muted); margin: 12px 0 5px; font-weight: 500; }
+  input[type="text"], input[type="number"], select {
+    width: 100%;
+    padding: 10px 10px;
+    min-height: 44px;
+    border-radius: 2px;
+    border: 1px solid var(--border);
+    background: var(--bg-input);
+    color: var(--text);
+    font-size: 15px;
+    transition: border-color .2s, background .25s;
+  }
+  input[type="text"]:focus, input[type="number"]:focus, select:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 12px 16px; }
+  .row > div { flex: 1 1 160px; min-width: 0; }
+  .checks { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; margin-top: 8px; }
+  .checks label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+    font-size: 15px;
+    color: var(--text);
+    min-height: 36px;
+    cursor: pointer;
+  }
+  .checks input[type="radio"], .checks input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  button#go {
+    margin-top: 18px;
+    width: 100%;
+    padding: 14px;
+    min-height: 48px;
+    border: 1px solid var(--accent);
+    border-radius: 2px;
+    background: var(--accent);
+    color: var(--accent-text);
+    font-size: 16px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background .2s, border-color .2s;
+  }
+  button#go:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+  button#go:disabled { background: var(--accent-disabled); border-color: var(--accent-disabled); color: var(--text-hint); cursor: not-allowed; }
   input:disabled { opacity: .4; cursor: not-allowed; }
   label:has(input:disabled) { opacity: .5; }
-  .files { display: flex; gap: 12px; }
+  .files { display: flex; flex-direction: column; gap: 10px; }
   .files > div { flex: 1; }
-  input[type="file"] { width: 100%; font-size: 13px; color: #cfd3dc; }
+  input[type="file"] { width: 100%; font-size: 14px; color: var(--text-muted); padding: 8px 0; }
   .card.dropzone { transition: border-color .15s, background .15s; }
-  .card.dropzone.dragover { border-color: #4f8cff; background: #262f45; }
-  .dropzone-hint { color: #6f7686; font-size: 12px; margin: 0 0 10px; }
+  .card.dropzone.dragover { border-color: var(--accent); background: var(--dragover-bg); }
+  .dropzone-hint { color: var(--text-hint); font-size: 12px; margin: 0 0 10px; }
   #stats { display: none; }
-  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 22px; margin-top: 4px; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; margin-top: 4px; }
   .stats .item { display: flex; justify-content: space-between; gap: 10px; font-size: 14px; }
-  .stats .item .k { color: #9aa0ad; }
-  .stats .item .v { color: #e6e8ee; font-weight: 600; text-align: right; }
-  .estimate-note { color: #6f7686; font-size: 12px; margin: 12px 0 0; }
+  .stats .item .k { color: var(--text-muted); }
+  .stats .item .v { color: var(--text); font-weight: 600; text-align: right; }
+  .estimate-note { color: var(--text-hint); font-size: 12px; margin: 12px 0 0; }
   #status { display: none; }
-  .bar { height: 10px; background: #15171d; border-radius: 6px; overflow: hidden; margin: 4px 0 8px; }
-  .bar > div { height: 100%; width: 0; background: linear-gradient(90deg, #4f8cff, #6ad4ff); transition: width .2s; }
-  .msg { font-size: 13px; color: #9aa0ad; }
-  .err { color: #ff7a7a; }
-  .done { color: #6ad48a; }
-  a.result { display: inline-block; margin-top: 12px; padding: 10px 16px; border-radius: 8px; background: #2f855a; color: #fff; text-decoration: none; }
-  small.hint { color: #6f7686; font-size: 12px; margin-top: 6px; display: block; }
+  .bar { height: 8px; background: var(--bg-bar); border-radius: 1px; overflow: hidden; margin: 4px 0 10px; }
+  .bar > div { height: 100%; width: 0; background: var(--bar-fill); transition: width .3s; }
+  .msg { font-size: 14px; color: var(--text-muted); }
+  .err { color: var(--err); }
+  .done { color: var(--done); }
+  a.result {
+    display: inline-block; margin-top: 12px;
+    padding: 12px 20px; min-height: 44px;
+    border-radius: 2px;
+    background: var(--result-bg);
+    color: #fff; text-decoration: none;
+    font-weight: 600; font-size: 14px;
+  }
+  a.result:active { opacity: .8; }
+  small.hint { color: var(--text-hint); font-size: 12px; margin-top: 4px; display: block; }
+  @media (max-width: 520px) {
+    .wrap { padding: 24px 10px 60px; }
+    h1 { font-size: 20px; }
+    p.sub { font-size: 13px; margin-bottom: 18px; }
+    .card { padding: 14px 12px; margin-bottom: 12px; }
+    .row { flex-direction: column; gap: 0; }
+    .row > div { flex: 1 1 100%; margin-bottom: 4px; }
+    .checks { grid-template-columns: 1fr; gap: 6px; }
+    .stats { grid-template-columns: 1fr; }
+    #themeToggle { top: 10px; right: 10px; width: 38px; height: 38px; font-size: 18px; }
+  }
 </style>
 </head>
 <body>
+<button id="themeToggle" title="Toggle theme" aria-label="Toggle theme">&#9681;</button>
 <div class="wrap">
   <h1>worldraw</h1>
   <p class="sub">Upload a Minecraft world (a folder or a .zip) and render a top-down map.</p>
@@ -1144,6 +1276,19 @@ fn index_html() -> String {
   </div>
 </div>
 <script>
+  (function() {
+    var saved = localStorage.getItem('worldraw-theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', saved);
+    var btn = document.getElementById('themeToggle');
+    btn.textContent = saved === 'dark' ? '\u263E' : '\u263D';
+    btn.addEventListener('click', function() {
+      var cur = document.documentElement.getAttribute('data-theme');
+      var next = cur === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('worldraw-theme', next);
+      btn.textContent = next === 'dark' ? '\u263E' : '\u263D';
+    });
+  })();
   const form = document.getElementById('form');
   const go = document.getElementById('go');
   const statusBox = document.getElementById('status');
