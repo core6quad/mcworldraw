@@ -948,6 +948,8 @@ fn index_html() -> String {
   .checks input { width: auto; }
   button { margin-top: 22px; width: 100%; padding: 13px; border: 0; border-radius: 10px; background: #4f8cff; color: #fff; font-size: 16px; font-weight: 600; cursor: pointer; }
   button:disabled { background: #3a4152; color: #8b90a0; cursor: not-allowed; }
+  input:disabled { opacity: .4; cursor: not-allowed; }
+  label:has(input:disabled) { opacity: .5; }
   .files { display: flex; gap: 12px; }
   .files > div { flex: 1; }
   input[type="file"] { width: 100%; font-size: 13px; color: #cfd3dc; }
@@ -1039,6 +1041,36 @@ fn index_html() -> String {
   const resultBox = document.getElementById('result');
   const FLAGS = ['shadows', 'ao', 'bloom', 'transparency', 'night'];
   let timer = null;
+
+  const samplingRadios = form.querySelectorAll('input[name="sampling"]');
+
+  // Interlocking form constraints. A disabled control is kept in a forced
+  // state (value/checked) so the request always matches what the UI shows.
+  function currentSampling() {
+    for (const r of samplingRadios) if (r.checked) return r.value;
+    return 'normal';
+  }
+  function applyConstraints() {
+    const isNormal = currentSampling() === 'normal';
+    const isSingle = form.mode.value === 'single';
+
+    // Scale only applies in Normal mode; force it back to 1 otherwise.
+    form.scale.disabled = !isNormal;
+    if (!isNormal) form.scale.value = '1';
+
+    // Ambient occlusion and Bloom are only available with supersampling;
+    // force them off in Normal mode.
+    form.ao.disabled = isNormal;
+    form.bloom.disabled = isNormal;
+    if (isNormal) { form.ao.checked = false; form.bloom.checked = false; }
+
+    // Shadows are only available for a single big PNG; force off per-chunk.
+    form.shadows.disabled = !isSingle;
+    if (!isSingle) form.shadows.checked = false;
+  }
+  samplingRadios.forEach(r => r.addEventListener('change', applyConstraints));
+  form.mode.addEventListener('change', applyConstraints);
+  applyConstraints();
 
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
