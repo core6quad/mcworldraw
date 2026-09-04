@@ -953,6 +953,9 @@ fn index_html() -> String {
   .files { display: flex; gap: 12px; }
   .files > div { flex: 1; }
   input[type="file"] { width: 100%; font-size: 13px; color: #cfd3dc; }
+  .card.dropzone { transition: border-color .15s, background .15s; }
+  .card.dropzone.dragover { border-color: #4f8cff; background: #262f45; }
+  .dropzone-hint { color: #6f7686; font-size: 12px; margin: 0 0 10px; }
   #status { display: none; }
   .bar { height: 10px; background: #15171d; border-radius: 6px; overflow: hidden; margin: 4px 0 8px; }
   .bar > div { height: 100%; width: 0; background: linear-gradient(90deg, #4f8cff, #6ad4ff); transition: width .2s; }
@@ -969,8 +972,9 @@ fn index_html() -> String {
   <p class="sub">Upload a Minecraft world (a folder or a .zip) and render a top-down map.</p>
 
   <form id="form">
-    <div class="card">
+    <div class="card dropzone" id="dropzone">
       <label>World to render</label>
+      <p class="dropzone-hint" id="dropnote">Drag &amp; drop a world folder or a .zip archive here, or use the buttons below.</p>
       <div class="files">
         <div>
           <input type="file" id="folder" webkitdirectory directory multiple>
@@ -1072,17 +1076,98 @@ fn index_html() -> String {
   form.mode.addEventListener('change', applyConstraints);
   applyConstraints();
 
+  // --- Drag & drop onto the upload card: accepts a world folder or a .zip ---
+  const dropZone = document.getElementById('dropzone');
+  const folderInput = document.getElementById('folder');
+  const zipInput = document.getElementById('zip');
+  const dropNote = document.getElementById('dropnote');
+  let dropped = null; // { files: File[] } loaded via drag & drop
+
+  function readAllEntries(reader) {
+    return new Promise((resolve) => {
+      const acc = [];
+      const read = () => reader.readEntries(
+        (entries) => (entries.length === 0 ? resolve(acc) : (acc.push(...entries), read())),
+        () => resolve(acc),
+      );
+      read();
+    });
+  }
+  async function walkEntry(entry, prefix, out) {
+    if (entry.isFile) {
+      await new Promise((resolve, reject) =>
+        entry.file((f) => { f.__relpath = prefix; out.push(f); resolve(); }, reject));
+    } else if (entry.isDirectory) {
+      for (const e of await readAllEntries(entry.createReader())) {
+        await walkEntry(e, prefix + '/' + e.name, out);
+      }
+    }
+  }
+  function setInputFiles(input, files) {
+    const dt = new DataTransfer();
+    for (const f of files) dt.items.add(f);
+    input.files = dt.files;
+  }
+  function setNote(text) { if (dropNote) dropNote.textContent = text; }
+
+  // Picking via a button clears any drop, and vice-versa (handled in handleDrop).
+  folderInput.addEventListener('change', () => { dropped = null; });
+  zipInput.addEventListener('change', () => { dropped = null; });
+
+  async function handleDrop(e) {
+    let folderEntry = null, zipFile = null;
+    for (const it of Array.from(e.dataTransfer.items)) {
+      if (it.kind !== 'file') continue;
+      const entry = it.webkitGetAsEntry ? it.webkitGetAsEntry() : null;
+      if (entry && entry.isDirectory) {
+        if (!folderEntry) folderEntry = entry;
+      } else {
+        const f = it.getAsFile();
+        if (f && /\.zip$/i.test(f.name) && !zipFile) zipFile = f;
+      }
+    }
+    if (folderEntry) {
+      const files = [];
+      await walkEntry(folderEntry, folderEntry.name, files);
+      if (files.length === 0) { setNote('That folder is empty — nothing to upload.'); return; }
+      dropped = { files };
+      setInputFiles(folderInput, files);
+      setInputFiles(zipInput, []);
+      setNote('Folder loaded: ' + files.length + ' file(s). Ready to render.');
+    } else if (zipFile) {
+      dropped = { files: [zipFile] };
+      setInputFiles(zipInput, [zipFile]);
+      setInputFiles(folderInput, []);
+      setNote('Archive loaded: ' + zipFile.name + '. Ready to render.');
+    } else {
+      setNote('Drop a world folder or a .zip archive.');
+    }
+  }
+  ['dragenter', 'dragover'].forEach((ev) => dropZone.addEventListener(ev, (e) => {
+    e.preventDefault(); e.stopPropagation();
+    dropZone.classList.add('dragover');
+  }));
+  dropZone.addEventListener('dragleave', (e) => {
+    e.preventDefault();
+    if (!dropZone.contains(e.relatedTarget)) dropZone.classList.remove('dragover');
+  });
+  dropZone.addEventListener('drop', (e) => {
+    e.preventDefault(); e.stopPropagation();
+    dropZone.classList.remove('dragover');
+    handleDrop(e);
+  });
+
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     const folder = document.getElementById('folder');
     const zip = document.getElementById('zip');
-    const files = folder.files.length ? folder.files : zip.files;
+    const files = dropped ? dropped.files : (folder.files.length ? folder.files : zip.files);
     if (!files || files.length === 0) {
       alert('Please choose a world folder or a .zip archive first.');
       return;
     }
     const fd = new FormData();
-    for (const f of files) fd.append('world', f, f.webkitRelativePath || f.name);
+    for (const f of files) fd.append('world', f, f.__relpath || f.webkitRelativePath || f.name);
     fd.append('dimension', form.dimension.value);
     fd.append('mode', form.mode.value);
     fd.append('scale', form.scale.value);
